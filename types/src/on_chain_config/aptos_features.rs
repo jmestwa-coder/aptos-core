@@ -169,6 +169,7 @@ pub enum FeatureFlag {
     ENCRYPTED_TRANSACTIONS = 108,
     /// Enables public struct and enum types as transaction arguments.
     PUBLIC_STRUCT_ENUM_ARGS = 109,
+    STORAGE_SLOT_NATIVES = 110,
 }
 
 impl FeatureFlag {
@@ -278,6 +279,7 @@ impl FeatureFlag {
             Self::VM_BINARY_FORMAT_V10,
             Self::SLH_DSA_SHA2_128S_SIGNATURE,
             Self::PUBLIC_STRUCT_ENUM_ARGS,
+            Self::STORAGE_SLOT_NATIVES,
         ]
     }
 }

@@ -846,6 +846,13 @@ module std::features {
         is_enabled(ENCRYPTED_TRANSACTIONS)
     }
 
+    /// Whether the storage slot natives are enabled.
+    const STORAGE_SLOT_NATIVES: u64 = 110;
+
+    public fun is_storage_slot_natives_enabled(): bool {
+        is_enabled(STORAGE_SLOT_NATIVES)
+    }
+
     // ============================================================================================
     // Feature Flag Implementation
 

@@ -13,6 +13,7 @@
 -  [Function `get_transaction_hash`](#0x1_transaction_context_get_transaction_hash)
 -  [Function `generate_unique_address`](#0x1_transaction_context_generate_unique_address)
 -  [Function `generate_auid_address`](#0x1_transaction_context_generate_auid_address)
+-  [Function `generate_unique_signer`](#0x1_transaction_context_generate_unique_signer)
 -  [Function `get_script_hash`](#0x1_transaction_context_get_script_hash)
 -  [Function `generate_auid`](#0x1_transaction_context_generate_auid)
 -  [Function `auid_address`](#0x1_transaction_context_auid_address)
@@ -63,7 +64,8 @@
     -  [Function `monotonically_increasing_counter_internal_for_test_only`](#@Specification_1_monotonically_increasing_counter_internal_for_test_only)
 
 
-<pre><code><b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/features.md#0x1_features">0x1::features</a>;
+<pre><code><b>use</b> <a href="create_signer.md#0x1_create_signer">0x1::create_signer</a>;
+<b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/features.md#0x1_features">0x1::features</a>;
 <b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/option.md#0x1_option">0x1::option</a>;
 <b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/string.md#0x1_string">0x1::string</a>;
 <b>use</b> <a href="timestamp.md#0x1_timestamp">0x1::timestamp</a>;
@@ -330,6 +332,35 @@ created for to feature gate the <code>generate_unique_address</code> function.
 
 <pre><code><b>public</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_generate_auid_address">generate_auid_address</a>(): <b>address</b> {
     <a href="transaction_context.md#0x1_transaction_context_generate_unique_address">generate_unique_address</a>()
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_transaction_context_generate_unique_signer"></a>
+
+## Function `generate_unique_signer`
+
+Returns a signer that is globally unique.
+Can be used to store resources in it, or to temporarily do things within the transaction.
+Cannot be stored on-chain, if you need that - use an object instead - object::create_object.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_generate_unique_signer">generate_unique_signer</a>(): <a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_generate_unique_signer">generate_unique_signer</a>(): <a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> {
+    <b>let</b> auid = <a href="transaction_context.md#0x1_transaction_context_generate_auid_address">generate_auid_address</a>();
+    <b>let</b> <a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> = <a href="create_signer.md#0x1_create_signer_create_signer">create_signer::create_signer</a>(auid);
+    <a href="../../aptos-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>
 }
 </code></pre>
 

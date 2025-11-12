@@ -361,5 +361,11 @@ crate::gas_schedule::macros::define_gas_parameters!(
 
         // Reflection
         [reflect_resolve_base: InternalGas, { RELEASE_V1_39.. => "reflect.resolve_base" }, 40960],
+
+        // Box
+        [box_borrow_base: InternalGas, "box.borrow.base", 919],
+        [box_borrow_per_byte_loaded: InternalGasPerByte, "box.borrow.per_byte_loaded", 1830],
+        [box_borrow_mut_base: InternalGas, "box.borrow_mut.base", 9190],
+        [box_borrow_mut_per_byte_loaded: InternalGasPerByte, "box.borrow_mut.per_byte_loaded", 1830],
     ]
 );

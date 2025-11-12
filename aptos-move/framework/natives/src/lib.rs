@@ -7,6 +7,7 @@ pub mod account;
 
 pub mod account_abstraction;
 pub mod aggregator_natives;
+pub mod storage_slot;
 pub mod code;
 pub mod consensus_config;
 pub mod create_signer;
@@ -97,6 +98,7 @@ pub fn all_natives(
     add_natives_from_module!("string_utils", string_utils::make_all(builder));
     add_natives_from_module!("consensus_config", consensus_config::make_all(builder));
     add_natives_from_module!("function_info", function_info::make_all(builder));
+    add_natives_from_module!("storage_slot", storage_slot::make_all(builder));
     add_natives_from_module!(
         "dispatchable_fungible_asset",
         dispatchable_fungible_asset::make_all(builder)
