@@ -22,8 +22,8 @@ use move_core_types::{
     account_address::AccountAddress,
     identifier::Identifier,
     language_storage::{
-        BORROW, BORROW_MUT, PACK, PACK_VARIANT, PUBLIC_STRUCT_DELIMITER, TEST_VARIANT, UNPACK,
-        UNPACK_VARIANT,
+        BORROW, BORROW_MUT, CONST_ACCESSOR_PREFIX, DOLLAR_SIGN_DELIMITER, PACK, PACK_VARIANT,
+        TEST_VARIANT, UNPACK, UNPACK_VARIANT,
     },
     metadata::Metadata,
 };
@@ -639,7 +639,7 @@ impl ModuleGenerator {
     ) -> BTreeMap<K, FF::FunctionHandleIndex> {
         let module = self.module_index(ctx, loc, &struct_env.module_env);
         let struct_name = struct_env.get_name_str();
-        let fun_name_prefix = format!("{}{}{}", op_prefix, PUBLIC_STRUCT_DELIMITER, struct_name);
+        let fun_name_prefix = format!("{}{}{}", op_prefix, DOLLAR_SIGN_DELIMITER, struct_name);
 
         let type_parameters = struct_env
             .get_type_parameters()
@@ -655,7 +655,7 @@ impl ModuleGenerator {
                     let name = format!(
                         "{}{}{}",
                         fun_name_prefix,
-                        PUBLIC_STRUCT_DELIMITER,
+                        DOLLAR_SIGN_DELIMITER,
                         variant.display(pool)
                     );
                     let field_types = struct_env
@@ -973,7 +973,7 @@ impl ModuleGenerator {
         let fun_name_prefix = format!(
             "{}{}{}",
             if is_imm { BORROW } else { BORROW_MUT },
-            PUBLIC_STRUCT_DELIMITER,
+            DOLLAR_SIGN_DELIMITER,
             struct_name
         );
         let struct_ty = Type::Struct(
@@ -1006,11 +1006,7 @@ impl ModuleGenerator {
                 let ty_order = ty_offset_to_order_map.get(&(*offset, ty.clone())).unwrap();
                 let name = format!(
                     "{}{}{}{}{}",
-                    fun_name_prefix,
-                    PUBLIC_STRUCT_DELIMITER,
-                    offset,
-                    PUBLIC_STRUCT_DELIMITER,
-                    ty_order
+                    fun_name_prefix, DOLLAR_SIGN_DELIMITER, offset, DOLLAR_SIGN_DELIMITER, ty_order
                 );
                 handle_elements.push((name, ty.clone(), variant_vec.clone(), offset));
             }
@@ -1042,7 +1038,7 @@ impl ModuleGenerator {
                 let offset = field.get_offset();
                 let ref_type = field.get_type().wrap_in_reference(!is_imm);
                 let return_: FF::SignatureIndex = self.signature(ctx, loc, vec![ref_type.clone()]);
-                let name = format!("{}{}{}", fun_name_prefix, PUBLIC_STRUCT_DELIMITER, offset);
+                let name = format!("{}{}{}", fun_name_prefix, DOLLAR_SIGN_DELIMITER, offset);
                 let idx = FF::FunctionHandleIndex(ctx.checked_bound(
                     loc,
                     self.module.function_handles.len(),
@@ -1719,8 +1715,22 @@ impl ModuleContext<'_> {
     /// function. This includes annotated ones as well as ones which are derived.
     /// Currently, a public function derives `Persistent`.
     pub(crate) fn function_attributes(&self, fun_env: &FunctionEnv) -> Vec<FF::FunctionAttribute> {
+        let fun_name = fun_env.symbol_pool().string(fun_env.get_name()).to_string();
+
         let mut result = vec![];
         let mut has_persistent = false;
+
+        // Compiler-generated `const$NAME` accessor functions carry ConstantAccessor.
+        // Public accessors also carry Persistent (non-removable on upgrade).
+        // We do not early-return here so that the attribute loop below can still
+        // pick up ModuleLock (or any future attribute) on these functions.
+        if fun_name.starts_with(CONST_ACCESSOR_PREFIX) {
+            result.push(FF::FunctionAttribute::ConstantAccessor);
+            if fun_env.visibility() == Visibility::Public {
+                has_persistent = true;
+                result.push(FF::FunctionAttribute::Persistent);
+            }
+        }
 
         // Validate that the attribute is not on script functions.
         let validate_not_script = |attr_name: &str, this: &Self| -> bool {

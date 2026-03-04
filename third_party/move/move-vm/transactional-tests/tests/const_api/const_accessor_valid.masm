@@ -1,0 +1,22 @@
+//# publish --print-bytecode --bytecode-version 11
+module 0x66::test_const_accessor_valid
+
+#[const] public fun const$MY_U64(): u64
+    ld_u64 42
+    ret
+
+#[const] public fun const$MY_VEC(): vector<u8>
+    ld_const<vector<u8>> [1, 2, 3]
+    ret
+
+#[const] public fun const$MY_VEC_ADDR(): vector<address>
+    ld_const<vector<address>> [0x1, 0x2]
+    ret
+
+#[const] public fun const$MY_ADDR(): address
+    ld_const<address> 0x42
+    ret
+
+#[const] public fun const$MY_I64(): i64
+    ld_i64 -1
+    ret

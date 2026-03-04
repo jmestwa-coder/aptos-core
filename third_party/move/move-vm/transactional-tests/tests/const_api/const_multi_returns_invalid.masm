@@ -1,0 +1,6 @@
+//# publish --print-bytecode --bytecode-version 11
+module 0x66::test_const_multi_returns_invalid
+
+#[const] public fun const$MY_VAL(): (u64, u64)
+    ld_u64 42
+    ret

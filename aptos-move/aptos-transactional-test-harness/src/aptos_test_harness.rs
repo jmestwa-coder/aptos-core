@@ -682,14 +682,20 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
         data: Option<NamedTempFile>,
         start_line: usize,
         command_lines_stop: usize,
+        bytecode_version: Option<u32>,
     ) -> Result<(
         NamedTempFile,
         Option<MoveSymbol>,
         CompiledModule,
         Option<String>,
     )> {
-        let (data, named_addr_opt, module, opt_model, warnings_opt) =
-            self.compile_module_default(syntax, data, start_line, command_lines_stop)?;
+        let (data, named_addr_opt, module, opt_model, warnings_opt) = self.compile_module_default(
+            syntax,
+            data,
+            start_line,
+            command_lines_stop,
+            bytecode_version,
+        )?;
         let warnings_opt = match (syntax, opt_model) {
             (SyntaxChoice::ASM, _) => warnings_opt,
             (_, Some(model)) => {

@@ -8,7 +8,7 @@
 //! abstract_interpreter.rs. CodeUnitVerifier simply orchestrates calls into these two files.
 use crate::{
     acquires_list_verifier::AcquiresVerifier,
-    control_flow, locals_safety,
+    const_api_checker, control_flow, locals_safety,
     meter::{BoundMeter, Meter, Scope},
     reference_safety,
     stack_usage_verifier::StackUsageVerifier,
@@ -24,7 +24,7 @@ use move_binary_format::{
         CompiledModule, CompiledScript, FunctionDefinition, FunctionDefinitionIndex,
         IdentifierIndex, TableIndex,
     },
-    file_format_common::VERSION_10,
+    file_format_common::{VERSION_10, VERSION_11},
     IndexKind,
 };
 use move_core_types::vm_status::StatusCode;
@@ -86,6 +86,12 @@ impl<'a> CodeUnitVerifier<'a> {
                     ctx,
                 )
                 .map_err(|err| err.at_index(IndexKind::FunctionDefinition, index.0))?;
+            }
+
+            // VERSION_11+ attribute checks: constant accessor validation.
+            if module.version() >= VERSION_11 {
+                const_api_checker::check_const_accessor_impl(module, function_definition)
+                    .map_err(|err| err.at_index(IndexKind::FunctionDefinition, index.0))?;
             }
 
             // Now reference_safety can safely trust that BorrowFieldMutable attributes

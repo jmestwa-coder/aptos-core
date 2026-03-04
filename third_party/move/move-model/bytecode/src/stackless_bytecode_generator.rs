@@ -2101,7 +2101,9 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                         *offset as usize,
                     ));
                 },
-                FunctionAttribute::Persistent | FunctionAttribute::ModuleLock => {},
+                FunctionAttribute::Persistent
+                | FunctionAttribute::ModuleLock
+                | FunctionAttribute::ConstantAccessor => {},
             }
         }
         None

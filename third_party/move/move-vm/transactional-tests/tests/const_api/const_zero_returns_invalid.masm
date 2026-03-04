@@ -1,0 +1,6 @@
+//# publish --print-bytecode --bytecode-version 11
+module 0x66::test_const_zero_returns_invalid
+
+#[const] public fun const$MY_VAL()
+    nop
+    ret

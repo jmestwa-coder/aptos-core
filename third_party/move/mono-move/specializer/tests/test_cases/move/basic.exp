@@ -1,5 +1,5 @@
 === masm ===
-// Bytecode version v10
+// Bytecode version v11
 module 0x42::basic
 struct Point has copy + drop
   x: u64

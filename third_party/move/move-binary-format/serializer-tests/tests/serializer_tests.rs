@@ -11,7 +11,7 @@ use move_binary_format::{
         AddressSpecifier, CompiledModule, CompiledScript, FunctionAttribute, FunctionHandle,
         IdentifierIndex, ResourceSpecifier, Signature, SignatureIndex, SignatureToken, TableIndex,
     },
-    file_format_common::{IDENTIFIER_SIZE_MAX, VERSION_10, VERSION_7, VERSION_MAX},
+    file_format_common::{IDENTIFIER_SIZE_MAX, VERSION_7, VERSION_MAX},
 };
 use move_core_types::{
     ability::AbilitySet, account_address::AccountAddress, identifier::Identifier,
@@ -182,16 +182,16 @@ fn test_borrow_field_attributes_round_trip() {
         attributes: vec![FunctionAttribute::BorrowFieldMutable(3)],
     });
 
-    // Serialize with VERSION_10 (attributes supported from VERSION_8+)
+    // Serialize with VERSION_MAX (attributes supported from VERSION_8+)
     let mut serialized = Vec::new();
     module
-        .serialize_for_version(Some(VERSION_10), &mut serialized)
+        .serialize_for_version(Some(VERSION_MAX), &mut serialized)
         .expect("serialization should work");
 
     // Deserialize and verify
     let deserialized = CompiledModule::deserialize_with_config(
         &serialized,
-        &DeserializerConfig::new(VERSION_10, IDENTIFIER_SIZE_MAX),
+        &DeserializerConfig::new(VERSION_MAX, IDENTIFIER_SIZE_MAX),
     )
     .expect("deserialization should work");
 

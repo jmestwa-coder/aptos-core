@@ -19,6 +19,7 @@ use crate::{
     ty::{Constraint, PrimitiveType, ReferenceKind, Type},
 };
 use legacy_move_compiler::parser::ast as PA;
+use move_binary_format::file_format::Visibility;
 use move_core_types::{
     ability::{Ability, AbilitySet},
     int256::{I256, U256},
@@ -56,6 +57,8 @@ pub(crate) fn declare_builtins(trans: &mut ModelBuilder) {
         ty: ty.clone(),
         value: Value::Number(value),
         visibility,
+        move_visibility: Visibility::Private,
+        has_package_visibility: false,
         users: BTreeSet::new(),
         attributes: vec![],
     };
@@ -68,6 +71,8 @@ pub(crate) fn declare_builtins(trans: &mut ModelBuilder) {
         ty: bool_t.clone(),
         value: Value::Bool(value),
         visibility,
+        move_visibility: Visibility::Private,
+        has_package_visibility: false,
         users: BTreeSet::new(),
         attributes: vec![],
     };

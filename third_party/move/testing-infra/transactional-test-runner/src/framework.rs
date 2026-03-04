@@ -178,14 +178,21 @@ pub trait MoveTestAdapter<'a>: Sized {
         data: Option<NamedTempFile>,
         start_line: usize,
         command_lines_stop: usize,
+        bytecode_version: Option<u32>,
     ) -> Result<(
         NamedTempFile,
         Option<Symbol>,
         CompiledModule,
         Option<String>,
     )> {
-        let (data, named_addr_opt, module, _opt_model, warnings_opt) =
-            self.compile_module_default(syntax, data, start_line, command_lines_stop)?;
+        let (data, named_addr_opt, module, _opt_model, warnings_opt) = self
+            .compile_module_default(
+                syntax,
+                data,
+                start_line,
+                command_lines_stop,
+                bytecode_version,
+            )?;
         Ok((data, named_addr_opt, module, warnings_opt))
     }
 
@@ -195,6 +202,7 @@ pub trait MoveTestAdapter<'a>: Sized {
         data: Option<NamedTempFile>,
         start_line: usize,
         command_lines_stop: usize,
+        bytecode_version: Option<u32>,
     ) -> Result<(
         NamedTempFile,
         Option<Symbol>,
@@ -264,7 +272,7 @@ pub trait MoveTestAdapter<'a>: Sized {
                 (named_addr_opt, module, opt_model, warnings_opt)
             },
             SyntaxChoice::ASM => {
-                let module = compile_asm_module(state.dep_modules(), data_path)?;
+                let module = compile_asm_module(state.dep_modules(), data_path, bytecode_version)?;
                 (None, module, None, None)
             },
         };
@@ -327,7 +335,7 @@ pub trait MoveTestAdapter<'a>: Sized {
                 }
             },
             SyntaxChoice::ASM => {
-                let script = compile_asm_script(state.dep_modules(), data_path)?;
+                let script = compile_asm_script(state.dep_modules(), data_path, None)?;
                 (script, None, None)
             },
         };
@@ -376,8 +384,13 @@ pub trait MoveTestAdapter<'a>: Sized {
                         move_asm::disassembler::disassemble_script(String::new(), &script)?
                     },
                     PrintBytecodeInputChoice::Module => {
-                        let (_data, _named_addr_opt, module, _warnings_opt) =
-                            self.compile_module(syntax, data, start_line, command_lines_stop)?;
+                        let (_data, _named_addr_opt, module, _warnings_opt) = self.compile_module(
+                            syntax,
+                            data,
+                            start_line,
+                            command_lines_stop,
+                            None,
+                        )?;
                         self.cross_compile_task(&source);
                         self.cross_compile_module(&module)
                             .unwrap_or_else(|e| panic!("cross-compilation failed: {}", e));
@@ -391,12 +404,18 @@ pub trait MoveTestAdapter<'a>: Sized {
                     gas_budget,
                     syntax,
                     print_bytecode,
+                    bytecode_version,
                 },
                 extra_args,
             ) => {
                 let syntax = syntax.unwrap_or_else(|| self.default_syntax());
-                let (data, named_addr_opt, module, warnings_opt) =
-                    self.compile_module(syntax, data, start_line, command_lines_stop)?;
+                let (data, named_addr_opt, module, warnings_opt) = self.compile_module(
+                    syntax,
+                    data,
+                    start_line,
+                    command_lines_stop,
+                    bytecode_version,
+                )?;
                 self.register_temp_filename(&data);
                 // If bytecode printing is enabled, call the disassembler.
                 let printed = if print_bytecode {
@@ -915,8 +934,9 @@ fn remove_sub_dirs(dirs: &mut BTreeSet<String>) {
 fn compile_asm_module<'a>(
     deps: impl Iterator<Item = &'a CompiledModule>,
     path: &str,
+    bytecode_version: Option<u32>,
 ) -> Result<CompiledModule> {
-    if let Either::Left(m) = compile_asm(deps, path)? {
+    if let Either::Left(m) = compile_asm(deps, path, bytecode_version)? {
         Ok(m)
     } else {
         bail!("expected a module but found a script")
@@ -926,8 +946,9 @@ fn compile_asm_module<'a>(
 fn compile_asm_script<'a>(
     deps: impl Iterator<Item = &'a CompiledModule>,
     path: &str,
+    bytecode_version: Option<u32>,
 ) -> Result<CompiledScript> {
-    if let Either::Right(s) = compile_asm(deps, path)? {
+    if let Either::Right(s) = compile_asm(deps, path, bytecode_version)? {
         Ok(s)
     } else {
         bail!("expected a script but found a module")
@@ -937,8 +958,12 @@ fn compile_asm_script<'a>(
 fn compile_asm<'a>(
     deps: impl Iterator<Item = &'a CompiledModule>,
     path: &str,
+    bytecode_version: Option<u32>,
 ) -> Result<assembler::ModuleOrScript> {
-    let options = assembler::Options::default();
+    let mut options = assembler::Options::default();
+    if let Some(v) = bytecode_version {
+        options.module_builder_options.bytecode_version = v;
+    }
     let source = fs::read_to_string(path)?;
     assembler::assemble(&options, &source, deps)
         .map_err(|diags| anyhow!(assembler::diag_to_string("test", &source, diags)))

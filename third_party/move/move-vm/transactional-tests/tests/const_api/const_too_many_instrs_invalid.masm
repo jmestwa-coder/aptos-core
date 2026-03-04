@@ -1,0 +1,7 @@
+//# publish --print-bytecode --bytecode-version 11
+module 0x66::test_const_too_many_instrs_invalid
+
+#[const] public fun const$MY_VAL(): u64
+    nop
+    ld_u64 42
+    ret

@@ -40,7 +40,7 @@ use move_core_types::{
     ability::AbilitySet,
     account_address::AccountAddress,
     language_storage::{
-        self, BORROW, BORROW_MUT, PACK, PACK_VARIANT, TEST_VARIANT, UNPACK, UNPACK_VARIANT,
+        self, BORROW, BORROW_MUT, CONST, PACK, PACK_VARIANT, TEST_VARIANT, UNPACK, UNPACK_VARIANT,
     },
 };
 use num::BigInt;
@@ -508,6 +508,9 @@ impl<'a> BinaryModuleLoader<'a> {
                 },
                 FunctionAttribute::BorrowFieldMutable(offset) => {
                     add_attribute(BORROW_MUT, Some(*offset));
+                },
+                FunctionAttribute::ConstantAccessor => {
+                    add_attribute(CONST, None);
                 },
             }
         }

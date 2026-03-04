@@ -224,6 +224,7 @@ where
                     gas_budget: _,
                     syntax,
                     print_bytecode: _,
+                    bytecode_version,
                 },
                 _extra_args,
             ) => {
@@ -233,6 +234,7 @@ where
                     task.data,
                     task.start_line,
                     task.command_lines_stop,
+                    bytecode_version,
                 )?;
 
                 // Track the module for function resolution

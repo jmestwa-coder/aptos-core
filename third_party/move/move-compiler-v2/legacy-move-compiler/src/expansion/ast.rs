@@ -270,6 +270,7 @@ pub type AddressSpecifier = Spanned<AddressSpecifier_>;
 pub struct Constant {
     pub attributes: Attributes,
     pub loc: Loc,
+    pub visibility: Visibility,
     pub signature: Type,
     pub value: Exp,
 }
@@ -1713,6 +1714,7 @@ impl AstDebug for (ConstantName, &Constant) {
             Constant {
                 attributes,
                 loc: _loc,
+                visibility: _,
                 signature,
                 value,
             },

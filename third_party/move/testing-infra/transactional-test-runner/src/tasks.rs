@@ -296,6 +296,8 @@ pub struct PublishCommand {
     pub syntax: Option<SyntaxChoice>,
     #[clap(long = "print-bytecode")]
     pub print_bytecode: bool,
+    #[clap(long = "bytecode-version")]
+    pub bytecode_version: Option<u32>,
 }
 
 #[derive(Debug, Parser)]

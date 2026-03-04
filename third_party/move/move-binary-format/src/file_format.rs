@@ -385,6 +385,8 @@ pub enum FunctionAttribute {
     /// Attribute for the API mutably borrowing a field from a non-private struct or enum.
     /// MemberCount represents the offset of the field.
     BorrowFieldMutable(MemberCount),
+    /// Attribute for the API accessing a non-private constant.
+    ConstantAccessor,
 }
 
 impl FunctionAttribute {
@@ -412,7 +414,8 @@ impl FunctionAttribute {
             | FunctionAttribute::UnpackVariant(_)
             | FunctionAttribute::TestVariant(_)
             | FunctionAttribute::BorrowFieldImmutable(_)
-            | FunctionAttribute::BorrowFieldMutable(_) => true,
+            | FunctionAttribute::BorrowFieldMutable(_)
+            | FunctionAttribute::ConstantAccessor => true,
         }
     }
 }
@@ -443,6 +446,7 @@ impl fmt::Display for FunctionAttribute {
             FunctionAttribute::BorrowFieldMutable(offset) => {
                 write!(f, "borrow_mut({})", offset)
             },
+            FunctionAttribute::ConstantAccessor => write!(f, "const"),
         }
     }
 }
