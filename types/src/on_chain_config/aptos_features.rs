@@ -169,6 +169,8 @@ pub enum FeatureFlag {
     ENCRYPTED_TRANSACTIONS = 108,
     /// Enables public struct and enum types as transaction arguments.
     PUBLIC_STRUCT_ENUM_ARGS = 109,
+    /// Enables the high-execution-limit transaction tier for a flat premium.
+    HIGH_EXECUTION_LIMIT_TRANSACTIONS = 110,
 }
 
 impl FeatureFlag {
@@ -278,6 +280,7 @@ impl FeatureFlag {
             Self::VM_BINARY_FORMAT_V10,
             Self::SLH_DSA_SHA2_128S_SIGNATURE,
             Self::PUBLIC_STRUCT_ENUM_ARGS,
+            Self::HIGH_EXECUTION_LIMIT_TRANSACTIONS,
         ]
     }
 }
@@ -481,6 +484,10 @@ impl Features {
 
     pub fn is_encrypted_transactions_enabled(&self) -> bool {
         self.is_enabled(FeatureFlag::ENCRYPTED_TRANSACTIONS)
+    }
+
+    pub fn is_high_execution_limit_transactions_enabled(&self) -> bool {
+        self.is_enabled(FeatureFlag::HIGH_EXECUTION_LIMIT_TRANSACTIONS)
     }
 
     pub fn get_max_identifier_size(&self) -> u64 {
