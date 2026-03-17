@@ -44,14 +44,24 @@ module aptos_framework::high_execution_limit {
     }
 
     /// Called at each epoch boundary to reset the counter.
+    ///
+    /// Guards against the resource not existing so that a governance transaction enabling
+    /// the feature flag before `initialize()` has been called on an existing network does
+    /// not abort the epoch boundary and halt the chain.
     public(friend) fun on_new_epoch() acquires HighExecutionLimitConfig {
+        if (!exists<HighExecutionLimitConfig>(@aptos_framework)) {
+            return
+        };
         let config = borrow_global_mut<HighExecutionLimitConfig>(@aptos_framework);
         let max_per_epoch = config.max_per_epoch;
         config.available = aggregator_v2::create_aggregator_with_value(max_per_epoch, max_per_epoch);
     }
 
-    /// Returns trie if the high execution limit is available. Only called in prologue.
+    /// Returns true if the high execution limit is available. Only called in prologue.
     public(friend) fun is_high_execution_limit_available(): bool acquires HighExecutionLimitConfig {
+        if (!exists<HighExecutionLimitConfig>(@aptos_framework)) {
+            return false
+        };
         let config = borrow_global<HighExecutionLimitConfig>(@aptos_framework);
         config.available.is_at_least(1)
     }
@@ -62,6 +72,9 @@ module aptos_framework::high_execution_limit {
     ///
     /// Prologue must check that the high execution limit is available.
     public(friend) fun record_used_high_execution_limit() acquires HighExecutionLimitConfig {
+        if (!exists<HighExecutionLimitConfig>(@aptos_framework)) {
+            return
+        };
         let config = borrow_global_mut<HighExecutionLimitConfig>(@aptos_framework);
         config.available.sub(1);
     }
