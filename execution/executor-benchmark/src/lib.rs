@@ -743,6 +743,25 @@ pub fn run_single_with_default_params(
     use_blockstm_v2: bool,
     mode: SingleRunMode,
 ) -> SingleRunResults {
+    run_single_with_default_params_and_executor::<AptosVMBlockExecutor>(
+        transaction_type,
+        test_folder,
+        concurrency_level,
+        use_blockstm_v2,
+        mode,
+    )
+}
+
+pub fn run_single_with_default_params_and_executor<V>(
+    transaction_type: TransactionType,
+    test_folder: impl AsRef<Path>,
+    concurrency_level: usize,
+    use_blockstm_v2: bool,
+    mode: SingleRunMode,
+) -> SingleRunResults
+where
+    V: VMBlockExecutor + 'static,
+{
     aptos_logger::Logger::new().init();
 
     match mode {
@@ -903,7 +922,7 @@ pub fn run_single_with_default_params(
         ..Default::default()
     };
 
-    run_benchmark::<AptosVMBlockExecutor>(
+    run_benchmark::<V>(
         benchmark_block_size, /* block_size */
         num_blocks,           /* num_blocks */
         BenchmarkWorkload::TransactionMix(vec![(transaction_type, 1)]),
@@ -1358,5 +1377,392 @@ mod tests {
                 num_init_accounts: 200,
             },
         );
+    }
+
+    /// Diagnostic test: run the same block of transactions through
+    /// `AptosVMBlockExecutor` (Move VM) and `PerpDexNativeVMBlockExecutor`
+    /// (native Rust VM), then print a per-transaction diff of every write set.
+    ///
+    /// The test currently uses `AptFaTransfer` transactions because the
+    /// PerpDEX Move modules are deployed via an external package step that
+    /// is not wired into the standard `TransactionTypeArg` enum.
+    /// `PerpDexNativeVMBlockExecutor` handles these through its `Passthrough`
+    /// path, so the comparison validates that passthrough produces the same
+    /// write sets as the real Move VM.
+    ///
+    /// To test with actual DEX entry functions, replace the
+    /// `AptFaTransfer` workload with a DEX-specific `TransactionType` once
+    /// one is wired into the benchmark infrastructure.
+    #[test]
+    fn test_compare_perpdex_move_and_native() {
+        use crate::native::perpdex_native_vm::PerpDexNativeVMBlockExecutor;
+
+        aptos_logger::Logger::new().init();
+
+        AptosVM::set_num_shards_once(1);
+        AptosVM::set_concurrency_level_once(1);
+        AptosVM::set_blockstm_v2_enabled_once(false);
+        NativeConfig::set_concurrency_level_once(1);
+
+        // ------------------------------------------------------------------
+        // 1. Create DB with 100 accounts
+        // ------------------------------------------------------------------
+        let storage_dir = TempPath::new();
+        let features = default_benchmark_features();
+        let storage_test_config = StorageTestConfig {
+            pruner_config: NO_OP_STORAGE_PRUNER_CONFIG,
+            enable_indexer_grpc: false,
+        };
+
+        crate::db_generator::create_db_with_accounts::<AptosVMBlockExecutor>(
+            100,               /* num_accounts */
+            1_000_000_000_000, /* init_account_balance */
+            5,                 /* block_size */
+            storage_dir.as_ref(),
+            storage_test_config,
+            false,
+            PipelineConfig::default(),
+            features.clone(),
+            false,
+        );
+
+        // ------------------------------------------------------------------
+        // 2. Checkpoint + open DB, run init workload (AptFaTransfer)
+        //    This publishes any required modules and pre-warms accounts.
+        // ------------------------------------------------------------------
+        let checkpoint_dir = TempPath::new();
+        super::create_checkpoint(
+            storage_dir.as_ref(),
+            checkpoint_dir.as_ref(),
+            false,
+        );
+
+        let (mut config, genesis_key) =
+            aptos_genesis::test_utils::test_config_with_custom_features(features.clone());
+        config.storage.dir = checkpoint_dir.as_ref().to_path_buf();
+        storage_test_config.init_storage_config(&mut config);
+        let db = super::init_db(&config);
+        let ts = std::sync::Arc::new(BenchmarkTimestamp::from_db(&db));
+        let root_account = std::sync::Arc::new(
+            TransactionGenerator::read_root_account(genesis_key, &db),
+        );
+
+        let transaction_type =
+            TransactionTypeArg::AptFaTransfer.materialize(1, true, WorkflowProgress::MoveByPhases);
+
+        let num_main_signer_accounts = 20;
+        let num_additional_dst_pool_accounts = 50;
+        let num_existing_accounts = TransactionGenerator::read_meta(&storage_dir);
+        let num_accounts_to_be_loaded = std::cmp::min(
+            num_existing_accounts,
+            num_main_signer_accounts + num_additional_dst_pool_accounts,
+        );
+
+        let accounts_cache = TransactionGenerator::gen_user_account_cache(
+            db.reader.clone(),
+            num_accounts_to_be_loaded,
+            0,
+            false,
+        );
+        let (main_signer_accounts, burner_accounts) =
+            accounts_cache.split(num_main_signer_accounts);
+
+        let (txn_generator_creator, _phase) = super::init_workload::<AptosVMBlockExecutor>(
+            vec![(transaction_type, 1)],
+            root_account.clone(),
+            main_signer_accounts,
+            burner_accounts,
+            db.clone(),
+            &PipelineConfig::default(),
+            std::sync::Arc::clone(&ts),
+        );
+
+        // ------------------------------------------------------------------
+        // 3. Generate one block of user transactions
+        // ------------------------------------------------------------------
+        let block_size: usize = 10;
+        let mut txn_gen = txn_generator_creator.create_transaction_generator();
+        let account_pool_size = std::cmp::min(num_existing_accounts, num_main_signer_accounts);
+        // Re-create account cache after init (sequence numbers may have changed).
+        let accounts_cache = TransactionGenerator::gen_user_account_cache(
+            db.reader.clone(),
+            account_pool_size,
+            0,
+            false,
+        );
+        let _txn_factory = TransactionGenerator::create_transaction_factory(&ts);
+
+        let mut user_txns: Vec<Transaction> = Vec::with_capacity(block_size);
+        for i in 0..block_size {
+            let sender_idx = i % accounts_cache.accounts.len();
+            let sender = &accounts_cache.accounts[sender_idx];
+            if let Some(signed_txn) = txn_gen.generate_transactions(sender, 1).pop() {
+                user_txns.push(Transaction::UserTransaction(signed_txn));
+            }
+        }
+
+        // Prepend a BlockMetadata transaction (every block needs one).
+        let block_metadata_txn = ts.next_block_metadata_txn(&db);
+        let mut block_txns = vec![block_metadata_txn];
+        block_txns.extend(user_txns);
+
+        println!(
+            "== Generated block with {} transactions ({} user + 1 BlockMetadata) ==",
+            block_txns.len(),
+            block_txns.len() - 1,
+        );
+
+        // ------------------------------------------------------------------
+        // 4. Execute with Move VM (AptosVMBlockExecutor)
+        // ------------------------------------------------------------------
+        let vm_result = {
+            let vm_executor = BlockExecutor::<AptosVMBlockExecutor>::new(db.clone());
+            let parent_block_id = vm_executor.committed_block_id();
+            let block_id = HashValue::random();
+            vm_executor
+                .execute_and_update_state(
+                    (
+                        block_id,
+                        into_signature_verified_block(block_txns.clone()),
+                    )
+                        .into(),
+                    parent_block_id,
+                    BENCHMARKS_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
+                )
+                .unwrap();
+            vm_executor
+                .ledger_update(block_id, parent_block_id)
+                .unwrap()
+                .execution_output
+        };
+
+        // ------------------------------------------------------------------
+        // 5. Execute with PerpDex Native VM (on same DB state — fresh
+        //    executor, same committed_block_id since nothing was committed).
+        // ------------------------------------------------------------------
+        let native_result = {
+            let native_executor =
+                BlockExecutor::<PerpDexNativeVMBlockExecutor>::new(db.clone());
+            let parent_block_id = native_executor.committed_block_id();
+            let block_id = HashValue::random();
+            native_executor
+                .execute_and_update_state(
+                    (
+                        block_id,
+                        into_signature_verified_block(block_txns.clone()),
+                    )
+                        .into(),
+                    parent_block_id,
+                    BENCHMARKS_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
+                )
+                .unwrap();
+            native_executor
+                .ledger_update(block_id, parent_block_id)
+                .unwrap()
+                .execution_output
+        };
+
+        // ------------------------------------------------------------------
+        // 6. Per-transaction write-set diff
+        // ------------------------------------------------------------------
+        let vm_to_commit = &vm_result.to_commit;
+        let native_to_commit = &native_result.to_commit;
+
+        println!(
+            "\n== Write-set comparison: Move VM ({} outputs) vs Native VM ({} outputs) ==\n",
+            vm_to_commit.transaction_outputs.len(),
+            native_to_commit.transaction_outputs.len(),
+        );
+
+        let max_len = std::cmp::max(
+            vm_to_commit.transaction_outputs.len(),
+            native_to_commit.transaction_outputs.len(),
+        );
+
+        let mut total_missing_in_native = 0usize;
+        let mut total_extra_in_native = 0usize;
+        let mut total_value_mismatch = 0usize;
+        let mut total_rg_tag_mismatch = 0usize;
+        let mut total_txns_with_diffs = 0usize;
+
+        for txn_idx in 0..max_len {
+            let vm_output = vm_to_commit.transaction_outputs.get(txn_idx);
+            let native_output = native_to_commit.transaction_outputs.get(txn_idx);
+
+            match (vm_output, native_output) {
+                (Some(vm_out), Some(native_out)) => {
+                    let vm_writes: HashMap<_, _> = vm_out
+                        .write_set()
+                        .write_op_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let native_writes: HashMap<_, _> = native_out
+                        .write_set()
+                        .write_op_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+
+                    let mut txn_missing = 0usize;
+                    let mut txn_extra = 0usize;
+                    let mut txn_value_mismatch = 0usize;
+                    let mut txn_rg_tag_mismatch = 0usize;
+                    let mut diff_details: Vec<String> = Vec::new();
+
+                    // Keys in Move VM but not in Native VM
+                    for (key, vm_val) in &vm_writes {
+                        match native_writes.get(key) {
+                            None => {
+                                txn_missing += 1;
+                                diff_details.push(format!(
+                                    "  MISSING in native: {:?}",
+                                    key
+                                ));
+                            },
+                            Some(native_val) => {
+                                // Check resource group tag-level diffs
+                                if let StateKeyInner::AccessPath(apath) = key.inner() {
+                                    if let Path::ResourceGroup(_) = apath.get_path() {
+                                        if let (Some(vm_bytes), Some(nat_bytes)) =
+                                            (vm_val.bytes(), native_val.bytes())
+                                        {
+                                            let vm_rg = bcs::from_bytes::<
+                                                BTreeMap<StructTag, Vec<u8>>,
+                                            >(
+                                                vm_bytes
+                                            );
+                                            let nat_rg = bcs::from_bytes::<
+                                                BTreeMap<StructTag, Vec<u8>>,
+                                            >(
+                                                nat_bytes
+                                            );
+                                            if let (Ok(vm_map), Ok(nat_map)) = (vm_rg, nat_rg) {
+                                                let vm_tags: std::collections::BTreeSet<_> =
+                                                    vm_map.keys().collect();
+                                                let nat_tags: std::collections::BTreeSet<_> =
+                                                    nat_map.keys().collect();
+                                                for tag in vm_tags.difference(&nat_tags) {
+                                                    txn_rg_tag_mismatch += 1;
+                                                    diff_details.push(format!(
+                                                        "  RG tag missing in native: {:?} (key {:?})",
+                                                        tag, key
+                                                    ));
+                                                }
+                                                for tag in nat_tags.difference(&vm_tags) {
+                                                    txn_rg_tag_mismatch += 1;
+                                                    diff_details.push(format!(
+                                                        "  RG tag extra in native: {:?} (key {:?})",
+                                                        tag, key
+                                                    ));
+                                                }
+                                                for tag in vm_tags.intersection(&nat_tags) {
+                                                    if vm_map[*tag] != nat_map[*tag] {
+                                                        txn_value_mismatch += 1;
+                                                        diff_details.push(format!(
+                                                            "  RG value mismatch for tag {:?}: vm {} bytes vs native {} bytes (key {:?})",
+                                                            tag,
+                                                            vm_map[*tag].len(),
+                                                            nat_map[*tag].len(),
+                                                            key,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Skip the whole-value comparison below for RG keys
+                                        // since we already did a tag-level diff.
+                                        continue;
+                                    }
+                                }
+                                // Non-RG value comparison
+                                if vm_val != native_val {
+                                    txn_value_mismatch += 1;
+                                    let vm_len =
+                                        vm_val.bytes().map(|b| b.len()).unwrap_or(0);
+                                    let nat_len =
+                                        native_val.bytes().map(|b| b.len()).unwrap_or(0);
+                                    diff_details.push(format!(
+                                        "  VALUE MISMATCH: {:?} (vm {} bytes vs native {} bytes)",
+                                        key, vm_len, nat_len
+                                    ));
+                                }
+                            },
+                        }
+                    }
+
+                    // Keys in Native VM but not in Move VM
+                    for key in native_writes.keys() {
+                        if !vm_writes.contains_key(key) {
+                            txn_extra += 1;
+                            diff_details.push(format!(
+                                "  EXTRA in native: {:?}",
+                                key
+                            ));
+                        }
+                    }
+
+                    let has_diffs = txn_missing > 0
+                        || txn_extra > 0
+                        || txn_value_mismatch > 0
+                        || txn_rg_tag_mismatch > 0;
+                    if has_diffs {
+                        total_txns_with_diffs += 1;
+                    }
+                    total_missing_in_native += txn_missing;
+                    total_extra_in_native += txn_extra;
+                    total_value_mismatch += txn_value_mismatch;
+                    total_rg_tag_mismatch += txn_rg_tag_mismatch;
+
+                    let status_match = vm_out.status() == native_out.status();
+                    let gas_match = vm_out.gas_used() == native_out.gas_used();
+                    let event_count_match =
+                        vm_out.events().len() == native_out.events().len();
+
+                    println!(
+                        "txn[{}]: vm_keys={} native_keys={} missing={} extra={} val_mismatch={} rg_tag_mismatch={} status_match={} gas_match={}({}/{}) events_match={}({}/{})",
+                        txn_idx,
+                        vm_writes.len(),
+                        native_writes.len(),
+                        txn_missing,
+                        txn_extra,
+                        txn_value_mismatch,
+                        txn_rg_tag_mismatch,
+                        status_match,
+                        gas_match,
+                        vm_out.gas_used(),
+                        native_out.gas_used(),
+                        event_count_match,
+                        vm_out.events().len(),
+                        native_out.events().len(),
+                    );
+                    for detail in &diff_details {
+                        println!("{}", detail);
+                    }
+                },
+                (Some(_), None) => {
+                    println!("txn[{}]: ONLY in Move VM (native has no output)", txn_idx);
+                    total_txns_with_diffs += 1;
+                },
+                (None, Some(_)) => {
+                    println!(
+                        "txn[{}]: ONLY in Native VM (Move VM has no output)",
+                        txn_idx
+                    );
+                    total_txns_with_diffs += 1;
+                },
+                (None, None) => {},
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 7. Summary
+        // ------------------------------------------------------------------
+        println!("\n========== COMPARISON SUMMARY ==========");
+        println!("Total transactions compared: {}", max_len);
+        println!("Transactions with diffs:     {}", total_txns_with_diffs);
+        println!("Keys missing in native:      {}", total_missing_in_native);
+        println!("Keys extra in native:        {}", total_extra_in_native);
+        println!("Value mismatches:            {}", total_value_mismatch);
+        println!("RG struct-tag mismatches:    {}", total_rg_tag_mismatch);
+        println!("========================================\n");
     }
 }

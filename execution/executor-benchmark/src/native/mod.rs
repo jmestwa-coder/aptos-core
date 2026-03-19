@@ -6,3 +6,8 @@ pub mod native_config;
 pub mod native_transaction;
 pub mod native_vm;
 pub mod parallel_uncoordinated_block_executor;
+pub mod perpdex_db_util;
+pub mod perpdex_executor;
+pub mod perpdex_native_vm;
+pub mod perpdex_transaction;
+pub mod perpdex_types;

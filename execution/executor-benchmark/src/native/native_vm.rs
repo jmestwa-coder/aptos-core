@@ -682,7 +682,7 @@ impl NativeVMExecutorTask {
         Ok(existed)
     }
 
-    fn create_single_resource_in_group_modification<T: Serialize>(
+    pub(crate) fn create_single_resource_in_group_modification<T: Serialize>(
         value: &T,
         group_key: &StateKey,
         resource_tag: StructTag,
