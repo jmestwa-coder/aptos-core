@@ -130,36 +130,6 @@ impl ExecutorTask for PerpDexNativeVMExecutorTask {
     ) -> ExecutionStatus<AptosTransactionOutput, VMStatus> {
         match self.execute_transaction_impl(executor_with_group_view, txn, txn_idx) {
             Ok((change_set, gas_units)) => {
-                // Log reads/writes for the first block of DEX transactions
-                static BLOCK_LOG_COUNTER: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let log_count =
-                    BLOCK_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if log_count < 400 {
-                    let perpdex_txn = PerpDexTransaction::parse(txn);
-                    let txn_type = match &perpdex_txn {
-                        PerpDexTransaction::UpdateOraclePrice { .. } => "Oracle",
-                        PerpDexTransaction::PlaceBulkOrders { .. } => "Bulk",
-                        PerpDexTransaction::PlaceOrder { .. } => "Order",
-                        PerpDexTransaction::ProcessPendingRequests { .. } => "Process",
-                        PerpDexTransaction::Passthrough => "Pass",
-                    };
-                    let market = perpdex_txn.market().map(|m| format!("{:.8}", m)).unwrap_or_default();
-                    let rws = change_set.resource_write_set();
-                    error!(
-                        "BLOCKSTM txn_idx={} type={} market={} writes={}",
-                        txn_idx, txn_type, market, rws.len(),
-                    );
-                    for (key, op) in rws {
-                        let op_kind = match op {
-                            AbstractResourceWriteOp::Write(_) => "Write",
-                            AbstractResourceWriteOp::WriteResourceGroup(_) => "GroupMod",
-                            AbstractResourceWriteOp::ResourceGroupInPlaceDelayedFieldChange(_) => "DelayedRG",
-                            _ => "Other",
-                        };
-                        error!("  WRITE {} {:?}", op_kind, key);
-                    }
-                }
                 ExecutionStatus::Success(AptosTransactionOutput::new(VMOutput::new(
                     change_set,
                     ModuleWriteSet::empty(),
