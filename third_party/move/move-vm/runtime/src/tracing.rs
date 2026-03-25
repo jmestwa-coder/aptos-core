@@ -56,8 +56,12 @@ pub(crate) fn is_tracing_enabled() -> &'static AtomicBool {
 
 #[inline]
 pub(crate) fn is_debugging_enabled() -> &'static AtomicBool {
-    DEBUGGING_ENABLED
-        .get_or_init(|| AtomicBool::new(env::var(MOVE_VM_STEPPING_ENV_VAR_NAME).is_ok()))
+    DEBUGGING_ENABLED.get_or_init(|| {
+        AtomicBool::new(
+            env::var(MOVE_VM_STEPPING_ENV_VAR_NAME).is_ok()
+                || env::var("MOVE_VM_STEP_COMMANDS").is_ok(),
+        )
+    })
 }
 
 pub fn flush_tracing_buffer() {

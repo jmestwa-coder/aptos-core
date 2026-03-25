@@ -635,7 +635,7 @@ impl LoadedFunction {
         self.function.get_native()
     }
 
-    pub(crate) fn index(&self) -> FunctionDefinitionIndex {
+    pub fn index(&self) -> FunctionDefinitionIndex {
         self.function.index
     }
 

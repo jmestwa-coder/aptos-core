@@ -20,6 +20,7 @@ use crate::{
         check_function_type_count_and_depth, verify_pack_closure, FullRuntimeTypeCheck,
         NoRuntimeTypeCheck, RuntimeTypeCheck, UntrustedOnlyRuntimeTypeCheck,
     },
+    source_locator,
     storage::{
         loader::traits::Loader, ty_depth_checker::TypeDepthChecker,
         ty_layout_converter::LayoutConverter,
@@ -1706,6 +1707,13 @@ where
         }
         debug_writeln!(buf)?;
 
+        // Print source location if available.
+        if let Some(module_id) = function.module_id() {
+            if let Some(loc) = source_locator::get_location(module_id, function.index(), frame.pc) {
+                debug_writeln!(buf, "          at {}", loc)?;
+            }
+        }
+
         // Print out the current instruction.
         debug_writeln!(buf)?;
         debug_writeln!(buf, "        Code:")?;
@@ -1723,12 +1731,58 @@ where
 
         // Print out the locals.
         debug_writeln!(buf)?;
-        debug_writeln!(buf, "        Locals:")?;
-        if !function.local_tys().is_empty() {
-            values::debug::print_locals(buf, &frame.locals, true)?;
-            debug_writeln!(buf)?;
-        } else {
+        if function.local_tys().is_empty() {
+            debug_writeln!(buf, "        Locals:")?;
             debug_writeln!(buf, "            (none)")?;
+        } else {
+            // Try to enrich the display with source-level names and struct
+            // field names when a source locator is registered.
+            let names_info = function.module_id().and_then(|mid| {
+                source_locator::get_function_param_and_local_names(mid, function.index())
+            });
+
+            // Always derive param_count from the bytecode signature — it is the
+            // authoritative boundary between parameter slots and local slots.
+            // The source map may report a different count when the compiler moves
+            // parameters into local slots, so trusting it causes mis-classification.
+            let param_count = function.param_tys().len();
+            if let Some((_, ref names)) = names_info {
+                // Build per-local struct field names from the source locator.
+                let struct_fields: Vec<Option<Vec<String>>> = function
+                    .local_tys()
+                    .iter()
+                    .map(|ty| {
+                        runtime_environment
+                            .get_struct_name(ty)
+                            .ok()
+                            .flatten()
+                            .and_then(|(mid, sname)| {
+                                source_locator::get_struct_field_names(&mid, sname.as_str())
+                            })
+                    })
+                    .collect();
+
+                values::debug::print_locals_with_info(
+                    buf,
+                    &frame.locals,
+                    true,
+                    param_count,
+                    Some(names.as_slice()),
+                    Some(struct_fields.as_slice()),
+                )?;
+            } else {
+                // No source map available, but the parameter count is known from
+                // the bytecode signature — use it to still split Parameters / Locals.
+                values::debug::print_locals_with_info(
+                    buf,
+                    &frame.locals,
+                    true,
+                    function.param_tys().len(),
+                    None,
+                    None,
+                )?;
+            }
+            debug_writeln!(buf)?;
         }
 
         debug_writeln!(buf)?;
@@ -2078,10 +2132,20 @@ impl Frame {
             };
             if is_tracing_for!(TraceCategory::VMError) {
                 let mut str = String::new();
+                let abort_idx = interpreter.call_stack.0.len();
                 if let Err(print_err) = interpreter
                     .debug_print_stack_trace(&mut str, interpreter.loader.runtime_environment())
                 {
                     str = format!("<while printing stack trace>: {}", print_err);
+                } else {
+                    // debug_print_stack_trace only covers parent frames; print the
+                    // aborting frame (self) separately as the innermost entry.
+                    let _ = interpreter.debug_print_frame(
+                        &mut str,
+                        interpreter.loader.runtime_environment(),
+                        abort_idx,
+                        self,
+                    );
                 }
                 eprintln!("trace vm_error {}:\n{}", e, str)
             }
