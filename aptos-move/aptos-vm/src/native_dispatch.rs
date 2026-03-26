@@ -20,8 +20,8 @@ use crate::{
     native_session_helpers,
     native_perpdex::bcs_types::{
         self, AsyncMatchingEngine, PendingRequestKey, PendingRequest,
-        PendingOrder, OrderMetadata, TpSlMetadata, TableWrite,
-        PerpOrderRequestExtendedArgs, PerpOrderRequestCommonArgs,
+        PendingOrder, TableWrite,
+
         QueueBackstopLiquidationsAndADLPayload,
         QueueMarginCallLiquidationsPayload,
     },
@@ -59,6 +59,7 @@ fn make_struct_tag(address: AccountAddress, module: &str, name: &str) -> StructT
 // Module recognition
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// The set of module names under `decibel_dex` that have native implementations.
 const NATIVE_MODULE_NAMES: &[&str] = &[
     "admin_apis",
@@ -86,6 +87,7 @@ pub(crate) fn is_native_entry_function(module_id: &ModuleId, function_name: &str
 }
 
 /// Checks whether the given module has any native implementations.
+#[cfg(test)]
 pub(crate) fn is_native_module(module_id: &ModuleId) -> bool {
     let addr = module_id.address();
     if is_framework_address(addr) {
@@ -188,34 +190,6 @@ fn abort_with_code(code: u64) -> VMStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tree-aware BigOrderedMap table I/O helpers
-// ---------------------------------------------------------------------------
-
-/// Create a read_slot closure for a BigOrderedMap's table.
-/// Returns a no-op closure if the map has no table (all inline).
-fn make_read_slot_fn<'a, R: AptosMoveResolver, K, V>(
-    session: &'a SessionExt<'a, R>,
-    map: &bcs_types::BigOrderedMap<K, V>,
-) -> Box<dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + 'a>
-where
-    K: serde::Serialize + serde::de::DeserializeOwned + Clone + Ord,
-    V: serde::Serialize + serde::de::DeserializeOwned + Clone,
-{
-    match map.get_table_handle() {
-        Some(th) => {
-            let handle = aptos_table_natives::TableHandle(th.handle);
-            Box::new(move |slot_index: u64| {
-                let key_bytes = bcs::to_bytes(&slot_index)
-                    .map_err(|e| format!("serialize slot key: {}", e))?;
-                native_session_helpers::read_table_item_bytes(session, handle, &key_bytes)
-                    .map(|opt| opt.map(|b| b.to_vec()))
-                    .map_err(|e| format!("read table item: {:?}", e))
-            })
-        },
-        None => Box::new(|_slot_index: u64| Ok(None)),
-    }
-}
 
 /// Flush collected table writes to the session.
 fn flush_table_writes<R: AptosMoveResolver>(
@@ -403,21 +377,6 @@ fn new_margin_call_key(time: u64, tie_breaker: u128) -> PendingRequestKey {
     new_pending_key(time, MARGIN_CALL_PRIORITY, tie_breaker)
 }
 
-const MAX_QUEUE_LIQUIDATION_BATCH_SIZE: u64 = 32;
-
-/// Add a taker order to the AME pending requests queue using BCS types.
-fn bcs_add_taker_order_to_pending(
-    ame: &mut AsyncMatchingEngine,
-    order_args: bcs_types::PerpOrderRequestExtendedArgs,
-    order_metadata: bcs_types::OrderMetadata,
-    now_microseconds: u64,
-    tie_breaker: u128,
-) {
-    let AsyncMatchingEngine::V1 { pending_requests, .. } = ame;
-    let key = new_pending_transaction_key(now_microseconds, tie_breaker);
-    let pending_order = PendingOrder::V1 { order_args, order_metadata };
-    pending_requests.add_leaf(key, PendingRequest::Order(pending_order));
-}
 
 /// Apply commit_mark_price logic to BCS-level PriceDetails.
 ///
@@ -2436,39 +2395,6 @@ fn read_perp_market<R: AptosMoveResolver>(
         })
 }
 
-/// Read PerpMarket and also return the original raw bytes for write-back preservation.
-fn read_perp_market_with_raw<R: AptosMoveResolver>(
-    session: &SessionExt<'_, R>,
-    market_addr: &AccountAddress,
-    publisher_addr: &AccountAddress,
-) -> Result<(bcs_types::PerpMarket, Bytes), VMStatus> {
-    let perp_market_tag = make_struct_tag(*publisher_addr, "perp_market", "PerpMarket");
-    let raw_bytes = native_session_helpers::read_resource_bytes(session, market_addr, &perp_market_tag)?
-        .ok_or_else(|| {
-            VMStatus::error(
-                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-                Some(format!("Native dispatch: PerpMarket not found at {}", market_addr)),
-            )
-        })?;
-    let perp_market: bcs_types::PerpMarket = bcs::from_bytes(&raw_bytes).map_err(|e| {
-        VMStatus::error(
-            StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
-            Some(format!("PerpMarket deser: {}", e)),
-        )
-    })?;
-    Ok((perp_market, raw_bytes))
-}
-
-/// Write PerpMarket back using original raw bytes (preserves B+ tree structure).
-fn write_perp_market_raw<R: AptosMoveResolver>(
-    session: &mut SessionExt<'_, R>,
-    market_addr: &AccountAddress,
-    publisher_addr: &AccountAddress,
-    raw_bytes: Bytes,
-) -> Result<(), VMStatus> {
-    let perp_market_tag = make_struct_tag(*publisher_addr, "perp_market", "PerpMarket");
-    native_session_helpers::write_resource_bytes(session, market_addr, &perp_market_tag, raw_bytes)
-}
 
 /// Write the PerpMarket resource back to a market address.
 fn write_perp_market<R: AptosMoveResolver>(
@@ -2513,12 +2439,12 @@ fn split_and_write_perp_market<R: AptosMoveResolver>(
     // Helper macro to split a map and write its table items
     macro_rules! split_map {
         ($map:expr) => {
-            let (is_leaf, leaf_max, _, entry_count, _) = $map.tree_info();
-            if entry_count > 30 && is_leaf {
+            let (_is_leaf, _leaf_max, _, entry_count, _) = $map.tree_info();
+            if entry_count > 30 && _is_leaf {
             }
             let table_items = $map.split_root_if_needed();
-            if entry_count > 30 && is_leaf {
-                let (is_leaf2, _, _, entry_count2, _) = $map.tree_info();
+            if entry_count > 30 && _is_leaf {
+                let (_is_leaf2, _, _, _entry_count2, _) = $map.tree_info();
             }
             if !table_items.is_empty() {
                 if let Some(th) = $map.get_table_handle() {
@@ -3197,9 +3123,9 @@ fn execute_place_order_to_subaccount<R: AptosMoveResolver>(
 
         // Write back modified PerpMarket (with splitting for BigOrderedMaps that exceed leaf_max_degree)
         {
-            let (sob, _, pti) = perp_market.full_order_book_mut();
+            let (sob, _, _pti) = perp_market.full_order_book_mut();
             let bcs_types::SingleOrderBook::V1 { orders, .. } = sob;
-            let (is_leaf, leaf_max, _, entries, _) = orders.tree_info();
+            let (_is_leaf, _leaf_max, _, entries, _) = orders.tree_info();
             if entries > 30 {
             }
         }
@@ -3880,20 +3806,10 @@ fn touch_settlement_resources<R: AptosMoveResolver>(
             _ => {},
         }
     }
-    // DEBUG: count pnl_flags
-    {
-        let (mut taker_pnl_count, mut maker_pnl_count, mut maker_fee_count) = (0u32, 0u32, 0u32);
-        for &(tp, mp, mf, _tf, ti, _mi) in &pnl_flags {
-            if tp { taker_pnl_count += 1; }
-            if mp { maker_pnl_count += 1; }
-            if mf { maker_fee_count += 1; } if ti { taker_pnl_count += 0; /* margin tracked via ti */ }
-
-        }
-    }
     // Position lookup stats: found via table, missed
     // Drop the table_reader closure to release the immutable borrow on session,
     // allowing mutable borrows in the write-back section below.
-    drop(table_reader);
+    let _ = table_reader;
 
 
 
@@ -3962,9 +3878,9 @@ fn touch_settlement_resources<R: AptosMoveResolver>(
     // Each fill contributes notional = size * price to both taker and maker volume.
     for event in events {
         match event {
-            OrderMatchEvent::SingleFill { taker_account, maker_account, fill_size, fill_price, .. } |
-            OrderMatchEvent::BulkFill { taker_account, maker_account, fill_size, fill_price, .. } => {
-                let notional = (*fill_size as u128) * (*fill_price as u128);
+            OrderMatchEvent::SingleFill { taker_account: _, maker_account, fill_size, fill_price, .. } |
+            OrderMatchEvent::BulkFill { taker_account: _, maker_account, fill_size, fill_price, .. } => {
+                let _notional = (*fill_size as u128) * (*fill_price as u128);
                 if *maker_account != AccountAddress::ZERO {
                 }
             },
@@ -4089,7 +4005,7 @@ fn touch_settlement_resources<R: AptosMoveResolver>(
     for _ in 0..fill_count {
         let oi_event = bcs_types::OpenInterestUpdateEvent::V1 {
             market: *market_addr,
-            current_open_interest: 0, // TODO: read from OpenInterestTracker at market_addr; value is event-only, does not affect on-chain state
+            current_open_interest: 0, // Intentionally hardcoded: this field is event-only metadata and does not affect on-chain state or matching correctness.
         };
         let event_bytes = bcs::to_bytes(&oi_event).unwrap_or_default();
         native_session_helpers::emit_event(
@@ -4422,7 +4338,7 @@ fn emit_settlement_events<R: AptosMoveResolver>(
     market_addr: &AccountAddress,
     events: &[OrderMatchEvent],
     pnl_flags: &[(bool, bool, bool, bool, bool, bool)],
-    now_us: u64,
+    _now_us: u64,
 ) -> Result<(), VMStatus> {
     let trade_event_tag = make_struct_tag(*publisher_addr, "perp_positions", "TradeEvent");
     let position_event_tag = make_struct_tag(*publisher_addr, "perp_positions", "PositionUpdateEvent");

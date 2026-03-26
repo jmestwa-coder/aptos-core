@@ -1,7 +1,13 @@
 // Copyright (c) Aptos Foundation
 // Translated from: decibel_dex::oracle
 
-use crate::native_perpdex::internal_oracle_state::InternalSourceIdentifier;
+// InternalSourceIdentifier inlined from deleted internal_oracle_state module.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InternalSourceIdentifier {
+    V1 {
+        object_address: [u8; 32],
+    },
+}
 use crate::native_perpdex::math::{self, Precision};
 use serde::{Deserialize, Serialize};
 

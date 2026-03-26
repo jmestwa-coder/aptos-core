@@ -1376,7 +1376,7 @@ impl PriceTimeIndex {
         &mut self,
         old_order: &BulkOrder,
     ) {
-        let BulkOrder::V1 { order_request, order_id, unique_priority_idx, .. } = old_order;
+        let BulkOrder::V1 { order_request, order_id: _, unique_priority_idx, .. } = old_order;
         let BulkOrderRequest::V1 { bid_prices, bid_sizes, ask_prices, ask_sizes, .. } = order_request;
         let PriceTimeIndex::V1 { buys, sells } = self;
 
@@ -2086,7 +2086,7 @@ impl BulkOrder {
         maker_is_bid: bool,
         matched_size: u64,
     ) -> (u64, Option<(u64, u64)>) {
-        let BulkOrder::V1 { order_request, unique_priority_idx, .. } = self;
+        let BulkOrder::V1 { order_request, unique_priority_idx: _, .. } = self;
         let BulkOrderRequest::V1 {
             bid_prices, bid_sizes, ask_prices, ask_sizes, ..
         } = order_request;
@@ -2099,19 +2099,19 @@ impl BulkOrder {
 
         // Find the active price level (first non-zero size)
         let mut fill_price = 0u64;
-        let mut remaining_match = matched_size;
+        let mut _remaining_match = matched_size;
         let mut consumed_level = false;
 
         for i in 0..prices.len().min(sizes.len()) {
             if sizes[i] > 0 {
                 fill_price = prices[i];
-                if remaining_match >= sizes[i] {
-                    remaining_match -= sizes[i];
+                if _remaining_match >= sizes[i] {
+                                        _remaining_match -= sizes[i];
                     sizes[i] = 0;
                     consumed_level = true;
                 } else {
-                    sizes[i] -= remaining_match;
-                    remaining_match = 0;
+                    sizes[i] -= _remaining_match;
+                    _remaining_match = 0;
                 }
                 break;
             }
@@ -2518,56 +2518,6 @@ pub struct TableWrite {
     pub is_new: bool,
 }
 
-/// A write-through cache for slot reads within a single tree operation.
-/// This is needed because tree_remove may write to a slot and then
-/// recursively need to read it back before the writes are applied externally.
-struct SlotCache<'a, F> {
-    read_slot: &'a F,
-    cache: std::cell::RefCell<std::collections::HashMap<u64, Vec<u8>>>,
-}
-
-impl<'a, F> SlotCache<'a, F>
-where F: Fn(u64) -> Result<Option<Vec<u8>>, String>,
-{
-    fn new(read_slot: &'a F) -> Self {
-        SlotCache {
-            read_slot,
-            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-        }
-    }
-
-    fn read(&self, slot_index: u64) -> Result<Option<Vec<u8>>, String> {
-        {
-            let cache = self.cache.borrow();
-            if let Some(data) = cache.get(&slot_index) {
-                return Ok(Some(data.clone()));
-            }
-        }
-        (self.read_slot)(slot_index)
-    }
-
-    fn write(&self, slot_index: u64, data: Vec<u8>) {
-        self.cache.borrow_mut().insert(slot_index, data);
-    }
-
-    fn as_reader(&self) -> impl Fn(u64) -> Result<Option<Vec<u8>>, String> + '_ {
-        move |slot_index: u64| self.read(slot_index)
-    }
-
-    /// Record a TableWrite to the cache so subsequent reads see it.
-    fn record_write(&self, tw: &TableWrite) {
-        self.cache.borrow_mut().insert(tw.slot_index, tw.data.clone());
-    }
-
-    /// Record multiple writes to cache.
-    fn record_writes(&self, writes: &[TableWrite]) {
-        let mut cache = self.cache.borrow_mut();
-        for tw in writes {
-            cache.insert(tw.slot_index, tw.data.clone());
-        }
-    }
-}
-
 /// Helper to read a Node from storage.
 fn read_node_from_slot<K, V, F>(
     slot_index: u64,
@@ -2597,14 +2547,6 @@ where
     bcs::to_bytes(&link).expect("B+Tree: serialize node")
 }
 
-fn serialize_vacant_link<K, V>(next: u64) -> Vec<u8>
-where
-    K: Serialize + DeserializeOwned + Clone,
-    V: Serialize + DeserializeOwned + Clone,
-{
-    let link: Link<Node<K, V>> = Link::Vacant { next };
-    bcs::to_bytes(&link).expect("B+Tree: serialize vacant link")
-}
 
 fn node_entries<K, V>(node: &Node<K, V>) -> &Vec<Entry<K, Child<V>>>
 where
@@ -2703,17 +2645,6 @@ where
         Ok((slot, true))
     }
 
-    /// Allocate a new slot index (simple version without reuse, for backward compat).
-    fn alloc_slot(&mut self) -> u64 {
-        let BigOrderedMap::BPlusTreeMap { nodes, .. } = self;
-        let StorageSlotsAllocator::V1 { new_slot_index, slots, .. } = nodes;
-        let slot = *new_slot_index;
-        *new_slot_index += 1;
-        if let Some(twl) = slots {
-            twl.length += 1;
-        }
-        slot
-    }
 
     /// Free a slot back to the reuse queue (matches Move's maybe_push_to_reuse_queue).
     /// Returns a TableWrite for the Link::Vacant entry if should_reuse is true.
@@ -2836,40 +2767,6 @@ where
         Err(format!("tree_find_leaf_path: exceeded max depth {}", max_depth))
     }
 
-    /// Find path from root to a specific node index (for parent updates).
-    fn tree_find_path_to<F>(&self, target: u64, read_slot: &F) -> Result<Vec<u64>, String>
-    where F: Fn(u64) -> Result<Option<Vec<u8>>, String>,
-    {
-        if target == 1 { return Ok(vec![1]); }
-        fn dfs_find<K2, V2, F2>(
-            map: &BigOrderedMap<K2, V2>,
-            cur: u64, target: u64, read_slot: &F2,
-        ) -> Result<Option<Vec<u64>>, String>
-        where
-            K2: Serialize + DeserializeOwned + Clone + Ord + std::fmt::Debug,
-            V2: Serialize + DeserializeOwned + Clone + std::fmt::Debug,
-            F2: Fn(u64) -> Result<Option<Vec<u8>>, String>,
-        {
-            let node = map.read_node(cur, read_slot)?;
-            if node_is_leaf(&node) {
-                return Ok(if cur == target { Some(vec![cur]) } else { None });
-            }
-            for e in node_entries(&node) {
-                if let Child::Inner { node_index } = &e.value {
-                    let ci = node_index.slot_index;
-                    if ci == target {
-                        return Ok(Some(vec![cur, target]));
-                    }
-                    if let Some(mut p) = dfs_find(map, ci, target, read_slot)? {
-                        p.insert(0, cur);
-                        return Ok(Some(p));
-                    }
-                }
-            }
-            Ok(None)
-        }
-        dfs_find(self, 1, target, read_slot).map(|o| o.unwrap_or_default())
-    }
 
     /// Update parent key pointers when a node's max key changed.
     fn tree_update_parent_key<F>(
@@ -2963,7 +2860,7 @@ where
         }
 
         // Find path to leaf
-        let mut path = self.tree_find_leaf_path(&key, read_slot)?;
+        let path = self.tree_find_leaf_path(&key, read_slot)?;
 
         // tree_find_leaf_path now always returns a valid path (goes to rightmost child
         // for key > all). This block handles the edge case where path is somehow empty.
@@ -2974,16 +2871,6 @@ where
         let result = self.tree_add_at(path, key, Child::Leaf { value }, read_slot);
         { let BigOrderedMap::BPlusTreeMap { write_cache, .. } = self; write_cache.clear(); }
         result
-    }
-
-    fn tree_add_at_with_extra<F>(
-        &mut self, path: Vec<u64>, key: K, child: Child<V>, read_slot: &F, mut extra: Vec<TableWrite>,
-    ) -> Result<Vec<TableWrite>, String>
-    where F: Fn(u64) -> Result<Option<Vec<u8>>, String>,
-    {
-        let mut writes = self.tree_add_at(path, key, child, read_slot)?;
-        writes.extend(extra);
-        Ok(writes)
     }
 
     /// Core add_at: insert child into the leaf identified by last element of path,
@@ -3762,7 +3649,7 @@ where
     /// Matches Move's recursive self.remove_at(path_to_node, &key_to_remove).
     fn tree_remove_inner_child<F>(
         &mut self,
-        mut path: Vec<u64>,
+        path: Vec<u64>,
         key: &K,
         read_slot: &F,
     ) -> Result<Vec<TableWrite>, String>
@@ -4459,7 +4346,7 @@ impl OnChainUserPositions {
         let new_position = match existing {
             Some(existing_pos) => {
                 let OnChainPerpPosition::V1 {
-                    size, entry_px_times_size_sum, avg_acquire_entry_px,
+                    size, entry_px_times_size_sum, avg_acquire_entry_px: _,
                     user_leverage, is_long, is_isolated,
                     funding_index_at_last_update,
                     unrealized_funding_amount_before_last_update,
