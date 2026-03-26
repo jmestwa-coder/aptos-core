@@ -1038,6 +1038,24 @@ impl AptosVM {
 
             // Execute the function. The function also must be an entry function!
             function.is_entry_or_err()?;
+
+            // Check for native execution path. Controlled by NATIVE_DISPATCH env var.
+            // Set NATIVE_DISPATCH=1 to enable native Rust execution of registered entry functions.
+            {
+                use std::sync::OnceLock;
+                static NATIVE_ENABLED: OnceLock<bool> = OnceLock::new();
+                let enabled = *NATIVE_ENABLED.get_or_init(|| {
+                    std::env::var("NATIVE_DISPATCH").map_or(false, |v| v == "1")
+                });
+                if enabled && crate::native_dispatch::is_native_entry_function(entry_fn.module(), entry_fn.function().as_str()) {
+                    return crate::native_dispatch::execute_native_entry_function(
+                        session,
+                        entry_fn,
+                        serialized_signers,
+                    );
+                }
+            }
+
             session.execute_loaded_function(
                 function,
                 args,
@@ -1531,6 +1549,73 @@ impl AptosVM {
         let maybe_publish_request = session.execute(|session| session.extract_publish_request());
         if maybe_publish_request.is_none() {
             let change_set = session.finish(change_set_configs, module_storage)?;
+
+            // Diagnostic logging for native dispatch gap analysis
+            {
+                use std::sync::OnceLock;
+                static DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
+                let diag = *DIAG_ENABLED.get_or_init(|| {
+                    std::env::var("NATIVE_DISPATCH_DIAG").map_or(false, |v| v == "1")
+                });
+                if diag {
+                    let num_writes = change_set.resource_write_set().len();
+                    let num_events = change_set.events().len();
+                    let mut total_event_bytes: usize = 0;
+                    let mut total_write_bytes: u64 = 0;
+                    // Collect per-event-type sizes
+                    let mut event_type_sizes: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+                    for (event, _) in change_set.events() {
+                        let data_len = event.event_data().len();
+                        total_event_bytes += data_len;
+                        let type_name = match event.type_tag() {
+                            move_core_types::language_storage::TypeTag::Struct(s) => {
+                                format!("{}::{}", s.module, s.name)
+                            },
+                            other => format!("{:?}", other),
+                        };
+                        let entry = event_type_sizes.entry(type_name).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += data_len;
+                    }
+                    // Collect per-write-key sizes
+                    let mut write_key_sizes: std::collections::BTreeMap<String, (usize, u64)> = std::collections::BTreeMap::new();
+                    for (key, op) in change_set.resource_write_set() {
+                        let wb = op.materialized_size().write_len().unwrap_or(0);
+                        total_write_bytes += wb;
+                        let key_str = format!("{:?}", key);
+                        // Extract just the struct tag from the key for grouping
+                        let short_key = if let Some(start) = key_str.find("::") {
+                            // Find the module::name pattern
+                            let before = &key_str[..start];
+                            let addr_start = before.rfind('/').map(|i| i + 1)
+                                .or_else(|| before.rfind(' ').map(|i| i + 1))
+                                .unwrap_or(0);
+                            key_str[addr_start..].split('>').next().unwrap_or(&key_str).to_string()
+                        } else {
+                            key_str.clone()
+                        };
+                        let entry = write_key_sizes.entry(short_key).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += wb;
+                    }
+                    let is_native = std::env::var("NATIVE_DISPATCH").map_or(false, |v| v == "1");
+                    // Build compact event summary: type=count*bytes
+                    let event_summary: Vec<String> = event_type_sizes.iter()
+                        .map(|(k, (c, b))| format!("{}={}*{}", k, c, b))
+                        .collect();
+                    let write_summary: Vec<String> = write_key_sizes.iter()
+                        .map(|(k, (c, b))| format!("{}={}*{}", k, c, b))
+                        .collect();
+                    eprintln!(
+                        "[DIAG] mode={} writes={} events={} event_bytes={} write_bytes={} evt_detail=[{}] write_detail=[{}]",
+                        if is_native { "native" } else { "move" },
+                        num_writes, num_events, total_event_bytes, total_write_bytes,
+                        event_summary.join(","),
+                        write_summary.join(","),
+                    );
+                }
+            }
+
             return UserSessionChangeSet::new(
                 change_set,
                 ModuleWriteSet::empty(),

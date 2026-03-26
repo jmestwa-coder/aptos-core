@@ -26,7 +26,13 @@ use aptos_types::{
 };
 use aptos_vm::{block_executor::AptosBlockExecutorWrapper, VMBlockExecutor};
 use move_core_types::vm_status::VMStatus;
+use once_cell::sync::Lazy;
 use std::sync::Arc;
+
+/// Persistent module cache manager shared across blocks, avoiding expensive
+/// re-initialization on every block.
+static MODULE_CACHE_MANAGER: Lazy<AptosModuleCacheManager> =
+    Lazy::new(AptosModuleCacheManager::new);
 
 pub struct PerpDexNativeVMBlockExecutor;
 
@@ -50,7 +56,7 @@ impl VMBlockExecutor for PerpDexNativeVMBlockExecutor {
             Arc::clone(&NATIVE_EXECUTOR_POOL),
             txn_provider,
             state_view,
-            &AptosModuleCacheManager::new(),
+            &MODULE_CACHE_MANAGER,
             BlockExecutorConfig {
                 local: BlockExecutorLocalConfig::default_with_concurrency_level(
                     NativeConfig::get_concurrency_level(),

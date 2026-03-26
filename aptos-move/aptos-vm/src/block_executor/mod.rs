@@ -526,13 +526,13 @@ impl<
         transaction_commit_listener: Option<L>,
     ) -> Result<BlockOutput<SignatureVerifiedTransaction, TransactionOutput>, VMStatus> {
         let _timer = BLOCK_EXECUTOR_EXECUTE_BLOCK_SECONDS.start_timer();
+        let pre_inner_start = std::time::Instant::now();
 
         let num_txns = signature_verified_block.num_txns();
         if state_view.id() != StateViewId::Miscellaneous {
-            // Speculation is disabled in Miscellaneous context, which is used by testing and
-            // can even lead to concurrent execute_block invocations, leading to errors on flush.
             init_speculative_logs(num_txns);
         }
+        let t_after_init_logs = std::time::Instant::now();
 
         BLOCK_EXECUTOR_CONCURRENCY.set(config.local.concurrency_level as i64);
 
@@ -541,6 +541,7 @@ impl<
             &config.local.module_cache_config,
             transaction_slice_metadata,
         )?;
+        let t_after_lock = std::time::Instant::now();
 
         let executor =
             BlockExecutor::<SignatureVerifiedTransaction, E, S, L, TP, AuxiliaryInfo>::new(
@@ -548,6 +549,19 @@ impl<
                 executor_thread_pool,
                 transaction_commit_listener,
             );
+        let t_after_new = std::time::Instant::now();
+
+        static PRE_INNER_LOG_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = PRE_INNER_LOG_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if c % 50 == 0 {
+            aptos_logger::info!(
+                "PERF pre-inner: init_logs={:?} try_lock={:?} new={:?} num_txns={}",
+                t_after_init_logs - pre_inner_start,
+                t_after_lock - t_after_init_logs,
+                t_after_new - t_after_lock,
+                num_txns,
+            );
+        }
 
         let ret = executor.execute_block(
             signature_verified_block,
@@ -557,11 +571,14 @@ impl<
         );
         match ret {
             Ok(block_output) => {
+                let t0 = std::time::Instant::now();
                 let (transaction_outputs, block_epilogue_txn) = block_output.into_inner();
+                let t1 = std::time::Instant::now();
                 let output_vec: Vec<_> = transaction_outputs
                     .into_iter()
                     .map(|output| output.take_output())
                     .collect();
+                let t2 = std::time::Instant::now();
 
                 // Flush the speculative logs of the committed transactions.
                 let pos = output_vec.partition_point(|o| !o.status().is_retry());
@@ -570,6 +587,16 @@ impl<
                     // Speculation is disabled in Miscellaneous context, which is used by testing and
                     // can even lead to concurrent execute_block invocations, leading to errors on flush.
                     flush_speculative_logs(pos);
+                }
+                let t3 = std::time::Instant::now();
+
+                static LOG_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let c = LOG_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c % 50 == 0 {
+                    aptos_logger::info!(
+                        "PERF execute_block_on_thread_pool post-inner: into_inner={:?} take_output={:?} flush_logs={:?} num_txns={}",
+                        t1 - t0, t2 - t1, t3 - t2, num_txns
+                    );
                 }
 
                 Ok(BlockOutput::new(output_vec, block_epilogue_txn))

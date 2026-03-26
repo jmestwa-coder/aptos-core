@@ -115,6 +115,8 @@ mod keyless_validation;
 pub mod keyless_validation;
 pub mod move_vm_ext;
 pub mod natives;
+pub mod native_dispatch;
+pub mod native_session_helpers;
 pub mod sharded_block_executor;
 pub mod system_module_names;
 pub mod testing;
@@ -122,6 +124,7 @@ pub mod transaction_metadata;
 mod transaction_validation;
 pub mod validator_txns;
 pub mod verifier;
+pub mod native_perpdex;
 
 pub use crate::aptos_vm::{AptosSimulationVM, AptosVM};
 use crate::sharded_block_executor::{executor_client::ExecutorClient, ShardedBlockExecutor};

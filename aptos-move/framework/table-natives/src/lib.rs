@@ -21,7 +21,7 @@ use bytes::Bytes;
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{
     account_address::AccountAddress, effects::Op, gas_algebra::NumBytes, identifier::Identifier,
-    value::MoveTypeLayout, vm_status::StatusCode,
+    language_storage::TypeTag, value::MoveTypeLayout, vm_status::StatusCode,
 };
 pub use move_table_extension::{TableHandle, TableInfo, TableResolver};
 use move_vm_runtime::{
@@ -139,6 +139,35 @@ impl<'a> NativeTableContext<'a> {
             session_hash,
             table_data: Default::default(),
         }
+    }
+
+    /// Creates a new table handle for native code use.
+    /// This mirrors the logic in `native_new_table_handle` but is callable
+    /// from outside the Move VM native function context.
+    /// The key_type and value_type are set to u64 / vector<u8> as generic placeholders
+    /// since native table operations use raw bytes anyway.
+    pub fn create_table_handle(&self) -> TableHandle {
+        use sha3::{Digest, Sha3_256};
+
+        let mut table_data = self.table_data.borrow_mut();
+        let mut digest = Sha3_256::new();
+        let table_len = table_data.new_tables.len() as u32;
+        Digest::update(&mut digest, self.session_hash);
+        Digest::update(&mut digest, table_len.to_be_bytes());
+        let bytes = digest.finalize().to_vec();
+        let handle = AccountAddress::from_bytes(&bytes[0..AccountAddress::LENGTH])
+            .expect("Unable to create table handle from SHA3 hash");
+
+        // Register with generic type tags (u64 key, vector<u8> value)
+        // These type tags don't matter for native table operations
+        let key_type = TypeTag::U64;
+        let value_type = TypeTag::Vector(Box::new(TypeTag::U8));
+        assert!(table_data
+            .new_tables
+            .insert(TableHandle(handle), TableInfo::new(key_type, value_type))
+            .is_none());
+
+        TableHandle(handle)
     }
 
     /// Computes the change set from a NativeTableContext.

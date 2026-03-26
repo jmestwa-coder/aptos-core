@@ -353,6 +353,7 @@ impl Parser {
         is_block: bool,
     ) -> Result<ExecutionOutput> {
         let _timer = OTHER_TIMERS.timer_with(&["parse_raw_output"]);
+        let parse_start = std::time::Instant::now();
 
         // Collect all statuses.
         let mut statuses_for_input_txns = {
@@ -402,28 +403,39 @@ impl Parser {
                 .transpose()?
         };
 
+        let t_prime_start = std::time::Instant::now();
         base_state_view.prime_cache(
             to_commit.state_update_refs(),
             if prime_state_cache {
                 PrimingPolicy::All
             } else {
-                // Most of the transaction reads should already be in the cache, but some module
-                // reads in the transactions might be done via the global module cache instead of
-                // cached state view, so they are not present in the cache.
-                // Therfore, we must prime the cache for the keys that we are going to promote into
-                // hot state, regardless of `prime_state_cache`, because the write sets have only
-                // the keys, not the values.
                 PrimingPolicy::MakeHotOnly
             },
         )?;
+        let t_prime_end = std::time::Instant::now();
 
+        let num_reads: usize = base_state_view.memorized_reads().shards.iter().map(|s| s.len()).sum();
         let (result_state, hot_state_updates) = parent_state.update_with_memorized_reads(
             base_state_view.persisted_hot_state(),
             base_state_view.persisted_state(),
             to_commit.state_update_refs(),
             base_state_view.memorized_reads(),
         )?;
+        let t_update_end = std::time::Instant::now();
         let state_reads = base_state_view.into_memorized_reads();
+
+        static PARSE_LOG_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = PARSE_LOG_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if c % 50 == 0 {
+            info!(
+                "PERF Parser::parse: pre={:?} prime_cache={:?} update_state={:?} num_reads={} first_version={}",
+                t_prime_start - parse_start,
+                t_prime_end - t_prime_start,
+                t_update_end - t_prime_end,
+                num_reads,
+                first_version,
+            );
+        }
 
         let out = ExecutionOutput::new(
             is_block,

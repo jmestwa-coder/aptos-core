@@ -1,0 +1,490 @@
+// Copyright (c) Aptos Foundation
+// Translated from: decibel_dex::dex_accounts
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::native_perpdex::order_book_types;
+use crate::native_perpdex::builder_code_registry;
+use crate::native_perpdex::perp_order;
+
+// ===================== Error Codes =====================
+
+const ENOT_SUBACCOUNT_OWNER: u64 = 1;
+const ESUBACCOUNT_DOESNT_EXIST: u64 = 2;
+const ENOT_SUBACCOUNT_OWNER_OR_LACKS_PERP_TRADING_PERMISSIONS: u64 = 3;
+const ENOT_SUBACCOUNT_OWNER_OR_LACKS_VAULT_TRADING_PERMISSIONS: u64 = 4;
+const ENOT_SUBACCOUNT_OWNER_OR_LACKS_FUNDS_MOVEMENT_PERMISSIONS: u64 = 5;
+const ENOT_SUBACCOUNT_OWNER_OR_LACKS_SUB_DELEGATION_PERMISSIONS: u64 = 6;
+const ECANNOT_TRANSFER_BETWEEN_DIFFERENT_OWNERS: u64 = 7;
+const ESUBACCOUNT_IS_NOT_ACTIVE: u64 = 8;
+const ESUBACCOUNT_HAS_ASSETS_OR_POSITIONS: u64 = 9;
+const ESEED_CANNOT_BE_PRIMARY_SUBACCOUNT_SEED: u64 = 10;
+const EINVALID_PUBLISHER: u64 = 11;
+const ERESTRICTED_API_ALREADY_REGISTERED: u64 = 12;
+const ERESTRICTED_API_NOT_REGISTERED: u64 = 13;
+
+// ===================== Constants =====================
+
+const PRIMARY_SUBACCOUNT_SEED: &[u8] = b"primary_subaccount";
+const SUBACCOUNT_MANAGER_SEED: &[u8] = b"GlobalSubaccountManager";
+const MAX_DELEGATION_DEPTH: u64 = 2;
+
+// ===================== Types =====================
+
+/// RESOURCE: Subaccount at subaccount object address
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Subaccount {
+    V1 {
+        extend_ref: Vec<u8>, // ExtendRef opaque
+        delegated_permissions: Vec<([u8; 32], DelegatedPermissions)>, // BigOrderedMap
+        is_active: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubaccountSeed {
+    pub owner_addr: [u8; 32],
+    pub seed: Vec<u8>,
+}
+
+// Events
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SubaccountCreatedEvent {
+    V1 {
+        subaccount: [u8; 32],
+        owner: [u8; 32],
+        is_primary: bool,
+        seed: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DelegationChangedEvent {
+    V1 {
+        subaccount: [u8; 32],
+        delegated_account: [u8; 32],
+        delegation: Option<PermissionType>,
+        expiration_time_s: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SubaccountActiveChangedEvent {
+    V1 {
+        subaccount: [u8; 32],
+        owner: [u8; 32],
+        is_active: bool,
+    },
+}
+
+// Permission Types
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionType {
+    TradePerpsAllMarkets,
+    TradePerpsOnMarket { market: [u8; 32] },
+    SubaccountFundsMovement,
+    SubDelegate,
+    TradeVaultTokens,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum StoredPermission {
+    Unlimited,
+    UnlimitedUntil(u64),
+    UnlimitedVia { authorized_by: [u8; 32] },
+    UnlimitedUntilVia { authorized_by: [u8; 32], expiration_time_s: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DelegatedPermissions {
+    V1 {
+        perms: BTreeMap<u8, StoredPermission>, // PermissionType index -> StoredPermission
+    },
+}
+
+/// RESOURCE: GlobalDexAccountsConfig at @decibel_dex
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum GlobalDexAccountsConfig {
+    V1 {
+        subaccount_manager_extend_ref: Vec<u8>, // ExtendRef opaque
+        // restricted_perp_api is a stored capability, opaque in native
+    },
+}
+
+// ===================== Functions =====================
+
+/// Initialize global config (called at module init).
+/// RESOURCE: GlobalDexAccountsConfig at @decibel_dex
+pub fn init_global_config(_publisher: [u8; 32]) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Create a primary subaccount object for a user.
+/// RESOURCE: Subaccount at computed address
+pub fn create_primary_subaccount_object(
+    _user_addr: [u8; 32],
+) -> [u8; 32] {
+    // EVENT: SubaccountCreatedEvent
+    [0u8; 32]
+}
+
+/// Create a new (secondary) subaccount.
+/// RESOURCE: Subaccount at new object address
+pub fn create_new_subaccount_object(
+    _owner: [u8; 32], // signer
+) -> [u8; 32] {
+    // EVENT: SubaccountCreatedEvent
+    [0u8; 32]
+}
+
+/// Create a new seeded non-primary subaccount.
+/// RESOURCE: Subaccount at computed address
+pub fn create_new_seeded_subaccount(
+    _owner: [u8; 32], // signer
+    _seed: Vec<u8>,
+) -> Result<[u8; 32], u64> {
+    // EVENT: SubaccountCreatedEvent
+    Ok([0u8; 32])
+}
+
+/// Admin-create a primary subaccount (idempotent, bypasses invite-only).
+pub fn admin_create_new_primary_subaccount(
+    _admin: [u8; 32], // signer
+    _user_addr: [u8; 32],
+) -> [u8; 32] {
+    [0u8; 32]
+}
+
+/// Delegate all trading permissions to another account for a subaccount.
+/// RESOURCE: Subaccount at subaccount
+pub fn delegate_all_trading_to_for_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _account_to_delegate_to: [u8; 32],
+    _expiration_time_s: Option<u64>,
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent (for TradePerpsAllMarkets and TradeVaultTokens)
+    Ok(())
+}
+
+/// Delegate perp trading permissions.
+/// RESOURCE: Subaccount at subaccount
+pub fn delegate_perp_trading_to_for_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _account_to_delegate_to: [u8; 32],
+    _expiration_time_s: Option<u64>,
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent
+    Ok(())
+}
+
+/// Delegate perp trading permissions for a specific market.
+/// RESOURCE: Subaccount at subaccount
+pub fn delegate_perp_trading_to_market_for_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _account_to_delegate_to: [u8; 32],
+    _market: [u8; 32],
+    _expiration_time_s: Option<u64>,
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent
+    Ok(())
+}
+
+/// Delegate sub-delegation permissions.
+/// RESOURCE: Subaccount at subaccount
+pub fn delegate_ability_to_sub_delegate_to_for_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _account_to_delegate_to: [u8; 32],
+    _expiration_time_s: Option<u64>,
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent
+    Ok(())
+}
+
+/// Delegate onchain account permissions (via ExtendRef).
+/// RESOURCE: Subaccount at subaccount
+pub fn delegate_onchain_account_permissions(
+    _auth_ref: Vec<u8>, // ExtendRef opaque
+    _subaccount: [u8; 32],
+    _account_to_delegate_to: [u8; 32],
+    _delegate_perp_trading: bool,
+    _delegate_vault_trading: bool,
+    _delegate_sub_delegation: bool,
+    _delegate_subaccount_funds_movement: bool,
+    _expiration_time_s: Option<u64>,
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent (multiple)
+    Ok(())
+}
+
+/// Revoke trading permissions from a delegated account.
+/// RESOURCE: Subaccount at subaccount
+pub fn revoke_delegation(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _account_to_revoke: [u8; 32],
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent
+    Ok(())
+}
+
+/// Revoke all delegated trading permissions.
+/// RESOURCE: Subaccount at subaccount
+pub fn revoke_all_delegations(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+) -> Result<(), u64> {
+    // EVENT: DelegationChangedEvent (for each revoked)
+    Ok(())
+}
+
+/// Deactivate a subaccount.
+/// RESOURCE: Subaccount at subaccount
+pub fn deactivate_subaccount(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _revoke_delegations: bool,
+) -> Result<(), u64> {
+    // EVENT: SubaccountActiveChangedEvent
+    Ok(())
+}
+
+/// Reactivate a subaccount.
+/// RESOURCE: Subaccount at subaccount
+pub fn reactivate_subaccount(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+) -> Result<(), u64> {
+    // EVENT: SubaccountActiveChangedEvent
+    Ok(())
+}
+
+/// Deposit funds to a subaccount at a specific address.
+pub fn deposit_to_subaccount_at(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Deposit funds to a subaccount (unpermissioned).
+pub fn deposit_funds_to_subaccount(
+    _subaccount: [u8; 32],
+    _funds_metadata: [u8; 32],
+    _funds_amount: u64,
+    _init_primary_if_not_exists_for_owner: Option<[u8; 32]>,
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Place a perp order for a subaccount.
+/// RESOURCE: Subaccount, PerpMarket, AsyncMatchingEngine
+pub fn place_perp_order_to_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _market: [u8; 32],
+    _order_request: perp_order::PerpOrderRequestCommonArgs,
+    _is_reduce_only: bool,
+    _stop_price: Option<u64>,
+    _tpsl_order_request: perp_order::PerpOrderRequestTpSlArgs,
+    _builder_code: Option<builder_code_registry::BuilderCode>,
+) -> Result<order_book_types::OrderId, u64> {
+    Ok(order_book_types::OrderId { order_id: 0 })
+}
+
+/// Cancel a perp order for a subaccount.
+/// RESOURCE: Subaccount, PerpMarket
+pub fn cancel_perp_order_to_subaccount(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _order_id: u128,
+    _market: [u8; 32],
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Withdraw from subaccount to owner's primary store.
+pub fn withdraw_from_subaccount(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Option<u128> {
+    None
+}
+
+/// Withdraw from cross collateral.
+pub fn withdraw_from_cross_collateral(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Option<u128> {
+    None
+}
+
+/// Withdraw from non-collateral primary store.
+pub fn withdraw_from_non_collateral(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) {
+    // Delegates to primary_fungible_store::transfer
+}
+
+/// Transfer from subaccount (onchain account, via ExtendRef).
+pub fn transfer_onchain_account_funds_from_subaccount(
+    _owner_ref: Vec<u8>, // ExtendRef opaque
+    _subaccount: [u8; 32],
+    _to_account: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Request withdrawal from onchain account's subaccount.
+pub fn request_withdrawal_onchain_account_from_subaccount(
+    _owner_ref: Vec<u8>, // ExtendRef opaque
+    _subaccount: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+    _recipient: [u8; 32],
+) -> Option<u128> {
+    None
+}
+
+/// Transfer collateral between subaccounts of the same owner.
+pub fn transfer_collateral_between_subaccounts(
+    _owner: [u8; 32], // signer
+    _from: [u8; 32],
+    _to: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Transfer fee to treasury from a subaccount.
+pub fn transfer_fee_to_treasury_from_subaccount(
+    _owner: [u8; 32], // signer
+    _from: [u8; 32],
+    _metadata: [u8; 32],
+    _amount: u64,
+) -> Result<(), u64> {
+    Ok(())
+}
+
+/// Set reserved collateral for a subaccount (vault config signer required).
+pub fn set_reserved_collateral_for_subaccount_for_vault(
+    _vault_config_signer: [u8; 32], // signer
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _wanted_to_set_reserved: u64,
+) -> u64 {
+    0
+}
+
+// ========== View Functions ==========
+
+/// Get the deterministic address for a user's primary subaccount.
+pub fn primary_subaccount(_owner_addr: [u8; 32]) -> [u8; 32] {
+    // Computed from GlobalSubaccountManager named object + BCS(SubaccountSeed)
+    [0u8; 32]
+}
+
+/// Get the primary subaccount as an object address.
+pub fn primary_subaccount_object(_owner: [u8; 32]) -> [u8; 32] {
+    primary_subaccount(_owner)
+}
+
+/// Public wrapper for primary_subaccount.
+pub fn primary_subaccount_public(owner_addr: [u8; 32]) -> [u8; 32] {
+    primary_subaccount(owner_addr)
+}
+
+/// Public wrapper for primary_subaccount_object.
+pub fn primary_subaccount_object_public(owner: [u8; 32]) -> [u8; 32] {
+    primary_subaccount_object(owner)
+}
+
+/// Get seeded subaccount address.
+pub fn seeded_subaccount_address(
+    _owner_addr: [u8; 32],
+    _seed: Vec<u8>,
+) -> [u8; 32] {
+    [0u8; 32]
+}
+
+/// View delegated permissions for a subaccount.
+/// RESOURCE: Subaccount at subaccount
+pub fn view_delegated_permissions(
+    _subaccount: [u8; 32],
+) -> Vec<([u8; 32], DelegatedPermissions)> {
+    Vec::new()
+}
+
+/// View if subaccount is active.
+/// RESOURCE: Subaccount at subaccount
+pub fn view_is_subaccount_active(_subaccount: [u8; 32]) -> bool {
+    true
+}
+
+/// Check if a subaccount exists.
+pub fn subaccount_exists(_subaccount_addr: [u8; 32]) -> bool {
+    false
+}
+
+/// Get subaccount signer if caller is the owner.
+/// Returns the subaccount signer address.
+/// RESOURCE: Subaccount at subaccount
+pub fn get_subaccount_signer_if_owner(
+    _owner: [u8; 32], // signer
+    _subaccount: [u8; 32],
+) -> Result<[u8; 32], u64> {
+    // Returns subaccount address (acts as signer)
+    Ok([0u8; 32])
+}
+
+/// Get subaccount signer if caller has perp trading permissions.
+/// RESOURCE: Subaccount at subaccount
+pub fn get_subaccount_signer_if_owner_or_delegated_for_perp_trading(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+    _market: [u8; 32],
+) -> Result<[u8; 32], u64> {
+    Ok([0u8; 32])
+}
+
+/// Get subaccount signer if caller has vault trading permissions.
+/// RESOURCE: Subaccount at subaccount
+pub fn get_subaccount_signer_if_owner_or_delegated_for_vault_trading(
+    _auth: [u8; 32], // signer
+    _subaccount: [u8; 32],
+) -> Result<[u8; 32], u64> {
+    Ok([0u8; 32])
+}
+
+/// Get subaccount object (unpermissioned, creates primary if needed).
+/// RESOURCE: Subaccount at subaccount_addr
+pub fn get_subaccount_object_unpermissioned(
+    _subaccount_addr: [u8; 32],
+    _init_primary_if_not_exists_for_owner: Option<[u8; 32]>,
+) -> Result<[u8; 32], u64> {
+    Ok([0u8; 32])
+}
+
+/// Assert subaccount is active.
+/// RESOURCE: Subaccount at subaccount
+pub fn assert_subaccount_is_active(_subaccount: [u8; 32]) -> Result<(), u64> {
+    Ok(())
+}

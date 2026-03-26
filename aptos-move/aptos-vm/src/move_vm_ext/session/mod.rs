@@ -24,12 +24,14 @@ use aptos_types::{
     transaction::user_transaction_context::UserTransactionContext, write_set::WriteOp,
 };
 use aptos_vm_types::{
+    abstract_write_op::AbstractResourceWriteOp,
     change_set::VMChangeSet, module_and_script_storage::module_storage::AptosModuleStorage,
     module_write_set::ModuleWrite, storage::change_set_configs::ChangeSetConfigs,
 };
 use bytes::Bytes;
 use move_binary_format::errors::{Location, PartialVMError, PartialVMResult, VMResult};
 use move_core_types::{
+    account_address::AccountAddress,
     effects::{AccountChanges, Changes, Op as MoveStorageOp},
     identifier::IdentStr,
     language_storage::{ModuleId, StructTag, TypeTag},
@@ -70,11 +72,116 @@ type AccountChangeSet = AccountChanges<BytesWithResourceLayout>;
 type ChangeSet = Changes<BytesWithResourceLayout>;
 pub type BytesWithResourceLayout = (Bytes, Option<TriompheArc<MoveTypeLayout>>);
 
+/// Cache for resources modified by native execution code.
+/// Maps (address, struct_tag) -> Some(bytes) for modifications/creations,
+/// or None for deletions.
+pub(crate) struct NativeResourceCache {
+    resources: BTreeMap<(AccountAddress, StructTag), Option<Bytes>>,
+}
+
+impl NativeResourceCache {
+    /// Creates a new empty cache.
+    pub(crate) fn new() -> Self {
+        Self {
+            resources: BTreeMap::new(),
+        }
+    }
+
+    /// Check if a resource is in the cache. Returns:
+    /// - `Some(&Some(bytes))` if set/modified
+    /// - `Some(&None)` if deleted
+    /// - `None` if not in cache
+    pub(crate) fn get(
+        &self,
+        addr: &AccountAddress,
+        tag: &StructTag,
+    ) -> Option<&Option<Bytes>> {
+        self.resources.get(&(*addr, tag.clone()))
+    }
+
+    /// Set or update a resource in the cache.
+    pub(crate) fn set(
+        &mut self,
+        addr: AccountAddress,
+        tag: StructTag,
+        bytes: Bytes,
+    ) {
+        if tag.module.as_str() == "async_matching_engine" && tag.name.as_str() == "AsyncMatchingEngine" {
+        }
+        self.resources.insert((addr, tag), Some(bytes));
+    }
+
+    /// Mark a resource as deleted in the cache.
+    pub(crate) fn delete(
+        &mut self,
+        addr: AccountAddress,
+        tag: StructTag,
+    ) {
+        self.resources.insert((addr, tag), None);
+    }
+
+    /// Consume the cache and return an iterator over all entries.
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = ((AccountAddress, StructTag), Option<Bytes>)> {
+        self.resources.into_iter()
+    }
+
+    /// Returns true if the cache is empty (no native writes/deletes).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+    }
+}
+
+/// Cache for table item writes from native execution code.
+/// Stores (handle, key, value, is_creation) tuples that will be merged into the table change set
+/// at finish time. The `is_creation` flag indicates whether the entry is being created (New) or
+/// modified (Modify) in the table, which determines the correct MoveStorageOp used during merging.
+pub(crate) struct NativeTableWriteCache {
+    items: Vec<(aptos_table_natives::TableHandle, Vec<u8>, Bytes, bool)>,
+}
+
+impl NativeTableWriteCache {
+    pub(crate) fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    /// Add a table item modification (the entry must already exist in storage).
+    pub(crate) fn add(&mut self, handle: aptos_table_natives::TableHandle, key: Vec<u8>, value: Bytes) {
+        self.items.push((handle, key, value, false));
+    }
+
+    /// Add a table item creation (the entry must NOT already exist in storage).
+    pub(crate) fn add_creation(&mut self, handle: aptos_table_natives::TableHandle, key: Vec<u8>, value: Bytes) {
+        self.items.push((handle, key, value, true));
+    }
+
+    /// Look up a table item by handle and key. Returns the most recent value
+    /// written for this (handle, key) pair, if any.
+    pub(crate) fn get(&self, handle: &aptos_table_natives::TableHandle, key: &[u8]) -> Option<Bytes> {
+        // Search from back to front to find the most recent write for this key.
+        for (h, k, v, _) in self.items.iter().rev() {
+            if h == handle && k.as_slice() == key {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub(crate) fn into_items(self) -> Vec<(aptos_table_natives::TableHandle, Vec<u8>, Bytes, bool)> {
+        self.items
+    }
+}
+
 pub struct SessionExt<'r, R> {
     data_cache: TransactionDataCache,
     extensions: NativeContextExtensions<'r>,
     pub(crate) resolver: &'r R,
     is_storage_slot_metadata_enabled: bool,
+    native_resource_cache: NativeResourceCache,
+    native_table_write_cache: NativeTableWriteCache,
 }
 
 impl<'r, R> SessionExt<'r, R>
@@ -103,8 +210,52 @@ where
             extensions,
             resolver,
             is_storage_slot_metadata_enabled,
+            native_resource_cache: NativeResourceCache::new(),
+            native_table_write_cache: NativeTableWriteCache::new(),
         }
     }
+
+    /// Returns an immutable reference to the native table write cache.
+    pub(crate) fn native_table_write_cache(&self) -> &NativeTableWriteCache {
+        &self.native_table_write_cache
+    }
+
+    /// Returns a mutable reference to the native table write cache.
+    pub(crate) fn native_table_write_cache_mut(&mut self) -> &mut NativeTableWriteCache {
+        &mut self.native_table_write_cache
+    }
+
+    /// Returns an immutable reference to the resolver.
+    ///
+    /// Used by native execution helpers to read resources directly from storage.
+    pub(crate) fn resolver(&self) -> &R {
+        self.resolver
+    }
+
+    /// Returns a mutable reference to the native context extensions.
+    ///
+    /// Used by native execution helpers to access event context, transaction
+    /// context, and other native extensions during native entry function execution.
+    pub(crate) fn extensions_mut(&mut self) -> &mut NativeContextExtensions<'r> {
+        &mut self.extensions
+    }
+
+    /// Returns an immutable reference to the native context extensions.
+    #[allow(dead_code)]
+    pub(crate) fn extensions(&self) -> &NativeContextExtensions<'r> {
+        &self.extensions
+    }
+
+    /// Returns an immutable reference to the native resource cache.
+    pub(crate) fn native_resource_cache(&self) -> &NativeResourceCache {
+        &self.native_resource_cache
+    }
+
+    /// Returns a mutable reference to the native resource cache.
+    pub(crate) fn native_resource_cache_mut(&mut self) -> &mut NativeResourceCache {
+        &mut self.native_resource_cache
+    }
+
 
     pub fn execute_function_bypass_visibility(
         &mut self,
@@ -218,6 +369,8 @@ where
             mut extensions,
             resolver,
             is_storage_slot_metadata_enabled,
+            native_resource_cache,
+            native_table_write_cache,
         } = self;
 
         let change_set = data_cache
@@ -243,7 +396,21 @@ where
 
         let woc = WriteOpConverter::new(resolver, is_storage_slot_metadata_enabled);
 
-        let change_set = Self::convert_change_set(
+        // Merge native resource cache entries into the change set.
+        // Resource group members (e.g., PerpMarket in ObjectGroup) are handled by
+        // building proper resource group writes that match the Move VM format.
+        let native_resource_write_set = if !native_resource_cache.is_empty() {
+            Self::convert_native_resource_cache_with_groups(
+                &woc,
+                native_resource_cache,
+                resolver,
+                module_storage,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+
+        let mut change_set = Self::convert_change_set(
             &woc,
             change_set,
             resource_group_change_set,
@@ -253,6 +420,53 @@ where
             configs.legacy_resource_creation_as_modification(),
         )
         .map_err(|e| e.finish(Location::Undefined))?;
+
+        // Merge native table item writes into the change set.
+        if !native_table_write_cache.is_empty() {
+            use aptos_vm_types::abstract_write_op::AbstractResourceWriteOp;
+
+            let mut native_table_writes: BTreeMap<StateKey, AbstractResourceWriteOp> = BTreeMap::new();
+            for (handle, key, value, is_creation) in native_table_write_cache.into_items() {
+                let state_key = StateKey::table_item(&aptos_types::state_store::table::TableHandle(handle.0), &key);
+                let storage_op = if is_creation {
+                    MoveStorageOp::New((value, None))
+                } else {
+                    MoveStorageOp::Modify((value, None))
+                };
+                let (write_op, _layout) = woc.convert_resource(
+                    &state_key,
+                    storage_op,
+                    false, // legacy_creation_as_modification
+                ).map_err(|e| e.finish(Location::Undefined))?;
+                native_table_writes.insert(state_key, AbstractResourceWriteOp::Write(write_op));
+            }
+            if !native_table_writes.is_empty() {
+                let native_table_change_set = VMChangeSet::new(
+                    native_table_writes,
+                    vec![],
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                );
+                change_set
+                    .squash_additional_change_set(native_table_change_set)
+                    .map_err(|e| e.finish(Location::Undefined))?;
+            }
+        }
+
+        // Squash native resource writes into the final change set.
+        if !native_resource_write_set.is_empty() {
+            let native_change_set = VMChangeSet::new(
+                native_resource_write_set,
+                vec![],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            );
+            change_set
+                .squash_additional_change_set(native_change_set)
+                .map_err(|e| e.finish(Location::Undefined))?;
+        }
 
         Ok(change_set)
     }
@@ -267,6 +481,193 @@ where
     pub(crate) fn mark_unbiasable(&mut self) {
         let txn_context = self.extensions.get_mut::<RandomnessContext>();
         txn_context.mark_unbiasable();
+    }
+
+
+    /// Converts native resource cache entries into AbstractResourceWriteOps.
+    ///
+    /// Native resources bypass the Move data cache and are written directly
+    /// as concrete WriteOps. Each cache entry is converted using the
+    /// WriteOpConverter which determines the correct op type (create/modify/delete)
+    /// based on whether the resource previously existed in storage.
+    fn convert_native_resource_cache(
+        woc: &WriteOpConverter,
+        native_resource_cache: NativeResourceCache,
+        resolver: &R,
+    ) -> VMResult<BTreeMap<StateKey, AbstractResourceWriteOp>> {
+        let mut result = BTreeMap::new();
+
+        for ((addr, tag), maybe_bytes) in native_resource_cache.into_iter() {
+            let state_key = resource_state_key(&addr, &tag)
+                .map_err(|e| e.finish(Location::Undefined))?;
+
+            // Determine if the resource previously existed to choose New vs Modify vs Delete.
+            let existed = resolver
+                .as_executor_view()
+                .get_resource_state_value_metadata(&state_key)
+                .map_err(|e| e.finish(Location::Undefined))?
+                .is_some();
+
+            let op: MoveStorageOp<BytesWithResourceLayout> = match maybe_bytes {
+                Some(bytes) => {
+                    if existed {
+                        MoveStorageOp::Modify((bytes, None))
+                    } else {
+                        MoveStorageOp::New((bytes, None))
+                    }
+                },
+                None => {
+                    // Deletion: resource must have existed.
+                    if !existed {
+                        return Err(
+                            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                                .with_message(format!(
+                                    "Native cache: deleting non-existent resource {:?} at {}",
+                                    tag, addr
+                                ))
+                                .finish(Location::Undefined),
+                        );
+                    }
+                    MoveStorageOp::Delete
+                },
+            };
+
+            let (write_op, layout) = woc
+                .convert_resource(&state_key, op, false)
+                .map_err(|e| e.finish(Location::Undefined))?;
+
+            result.insert(
+                state_key,
+                AbstractResourceWriteOp::from_resource_write_with_maybe_layout(write_op, layout),
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Enhanced version of convert_native_resource_cache that properly handles
+    /// resource group members. Resource group members (e.g., PerpMarket in ObjectGroup)
+    /// are grouped by their parent resource group, and the full group is read from
+    /// storage, updated with the new member bytes, and written as a single ResourceGroup
+    /// write op. This matches the Move VM's behavior where all members of a resource
+    /// group are written together.
+    fn convert_native_resource_cache_with_groups(
+        woc: &WriteOpConverter,
+        native_resource_cache: NativeResourceCache,
+        resolver: &R,
+        module_storage: &impl ModuleStorage,
+    ) -> VMResult<BTreeMap<StateKey, AbstractResourceWriteOp>> {
+        let mut result = BTreeMap::new();
+
+        // First pass: separate entries into resource group members and standalone resources.
+        // group_updates: (addr, group_tag) -> Vec<(member_tag, member_bytes)>
+        let mut group_updates: BTreeMap<(AccountAddress, StructTag), Vec<(StructTag, Option<Bytes>)>> = BTreeMap::new();
+        let mut standalone_entries: Vec<((AccountAddress, StructTag), Option<Bytes>)> = Vec::new();
+
+        for ((addr, tag), maybe_bytes) in native_resource_cache.into_iter() {
+            // Check if this struct tag is a resource group member.
+            // First try module metadata (works when module is in cache).
+            // If that fails (native dispatch may not load modules), check known
+            // resource group members by name.
+            let resource_group_tag = module_storage
+                .unmetered_get_existing_deserialized_module(&tag.address, &tag.module)
+                .ok()
+                .and_then(|module| {
+                    get_resource_group_member_from_metadata(&tag, &module.metadata)
+                })
+                .or_else(|| {
+                    // Fallback: known ObjectGroup members from the etna DEX contracts.
+                    // These structs are annotated with #[resource_group_member(group = ObjectGroup)]
+                    // in their Move source.
+                    let name = tag.name.as_str();
+                    let is_known_object_group_member = matches!(name,
+                        "PriceDetails" | "Price" | "PerpMarketConfig" | "PerpMarketConfiguration"
+                        | "PerpMarketOracleSource" | "Subaccount" | "ObjectCore" | "ObjectGroup"
+                        | "DelegatedAdminPermissions"
+                        | "InternalSourceState"
+                    );
+                    if is_known_object_group_member {
+                        Some(StructTag {
+                            address: AccountAddress::ONE,
+                            module: move_core_types::identifier::Identifier::new("object").unwrap(),
+                            name: move_core_types::identifier::Identifier::new("ObjectGroup").unwrap(),
+                            type_args: vec![],
+                        })
+                    } else {
+                        None
+                    }
+                });
+
+
+            if let Some(group_tag) = resource_group_tag {
+                group_updates
+                    .entry((addr, group_tag))
+                    .or_default()
+                    .push((tag, maybe_bytes));
+            } else {
+                standalone_entries.push(((addr, tag), maybe_bytes));
+            }
+        }
+
+
+        // Process standalone resources (same as convert_native_resource_cache)
+        for ((addr, tag), maybe_bytes) in standalone_entries {
+            let state_key = resource_state_key(&addr, &tag)
+                .map_err(|e| e.finish(Location::Undefined))?;
+            let existed = resolver
+                .as_executor_view()
+                .get_resource_state_value_metadata(&state_key)
+                .map_err(|e| e.finish(Location::Undefined))?
+                .is_some();
+            let op: MoveStorageOp<BytesWithResourceLayout> = match maybe_bytes {
+                Some(bytes) => {
+                    if existed { MoveStorageOp::Modify((bytes, None)) }
+                    else { MoveStorageOp::New((bytes, None)) }
+                },
+                None => {
+                    if !existed {
+                        return Err(
+                            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                                .with_message(format!(
+                                    "Native cache: deleting non-existent resource {:?} at {}", tag, addr
+                                ))
+                                .finish(Location::Undefined),
+                        );
+                    }
+                    MoveStorageOp::Delete
+                },
+            };
+            let (write_op, layout) = woc.convert_resource(&state_key, op, false)
+                .map_err(|e| e.finish(Location::Undefined))?;
+
+            result.insert(state_key, AbstractResourceWriteOp::from_resource_write_with_maybe_layout(write_op, layout));
+        }
+
+        // Process resource group members: build GroupWrite for each group
+        for ((addr, group_tag), members) in group_updates {
+            let group_state_key = StateKey::resource_group(&addr, &group_tag);
+
+            // Build individual member changes for convert_resource_group_v1.
+            // Since native dispatch only touches existing members (read-then-write-back),
+            // all changes are Modify operations.
+            let mut group_changes: BTreeMap<StructTag, MoveStorageOp<BytesWithResourceLayout>> = BTreeMap::new();
+            for (member_tag, maybe_bytes) in members {
+                match maybe_bytes {
+                    Some(bytes) => {
+                        group_changes.insert(member_tag, MoveStorageOp::Modify((bytes, None)));
+                    },
+                    None => {
+                        group_changes.insert(member_tag, MoveStorageOp::Delete);
+                    },
+                }
+            }
+
+            let group_write = woc.convert_resource_group_v1(&group_state_key, group_changes.clone())
+                .map_err(|e| e.finish(Location::Undefined))?;
+            result.insert(group_state_key, AbstractResourceWriteOp::WriteResourceGroup(group_write));
+        }
+
+        Ok(result)
     }
 
     fn populate_v0_resource_group_change_set(

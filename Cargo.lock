@@ -1632,6 +1632,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.9.9",
  "thread_local",
  "tokio",
  "toml 0.7.8",

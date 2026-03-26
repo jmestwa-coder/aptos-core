@@ -107,6 +107,43 @@ impl NativeTransactionContext {
     pub fn chain_id(&self) -> u8 {
         self.chain_id
     }
+
+    /// Increment the local counter and return the full monotonically increasing counter value.
+    /// This mirrors the Move `transaction_context::monotonically_increasing_counter()` function.
+    ///
+    /// Format: `<reserved_byte (8 bits)> || timestamp_us (64 bits) || transaction_index (32 bits) || session_counter (8 bits) || local_counter (16 bits)`
+    ///
+    /// Returns `None` if the user transaction context is not available or the local counter overflows.
+    pub fn next_monotonically_increasing_counter(&mut self, timestamp_us: u64) -> Option<u128> {
+        if self.local_counter == u16::MAX {
+            return None;
+        }
+        self.local_counter += 1;
+        let local_counter = self.local_counter as u128;
+        let session_counter = self.session_counter as u128;
+
+        let user_ctx = self.user_transaction_context_opt.as_ref()?;
+        let transaction_index_kind = user_ctx.transaction_index_kind();
+
+        let (reserved_byte, transaction_index) = match transaction_index_kind {
+            TransactionIndexKind::BlockExecution { transaction_index } => {
+                (0u128, transaction_index)
+            },
+            TransactionIndexKind::ValidationOrSimulation { transaction_index } => {
+                (1u128, transaction_index)
+            },
+            TransactionIndexKind::NotAvailable => {
+                return None;
+            },
+        };
+
+        let mut counter: u128 = reserved_byte << 120;
+        counter |= (timestamp_us as u128) << 56;
+        counter |= (transaction_index as u128) << 24;
+        counter |= session_counter << 16;
+        counter |= local_counter;
+        Some(counter)
+    }
 }
 
 /***************************************************************************************************

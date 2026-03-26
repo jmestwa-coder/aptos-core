@@ -65,6 +65,20 @@ impl NativeEventContext {
         self.events.iter().map(|(event, _)| event)
     }
 
+    /// Pushes a contract event into this context.
+    ///
+    /// This is used by native Rust execution to emit events without going through
+    /// the Move VM native function machinery. The event will be included in the
+    /// transaction output when the session is finalized.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The contract event to emit.
+    /// * `layout` - Optional type layout, needed only when the event contains delayed fields.
+    pub fn push_event(&mut self, event: ContractEvent, layout: Option<MoveTypeLayout>) {
+        self.events.push((event, layout));
+    }
+
     #[cfg(feature = "testing")]
     fn emitted_v1_events(&self, event_key: &EventKey, ty_tag: &TypeTag) -> Vec<&[u8]> {
         let mut events = vec![];
