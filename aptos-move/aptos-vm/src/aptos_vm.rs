@@ -846,6 +846,8 @@ impl AptosVM {
                     txn_data,
                     gas_meter.balance().into(),
                     fee_statement,
+                    module_storage,
+                    traversal_context,
                 )
             } else {
                 transaction_validation::run_failure_epilogue(
@@ -903,6 +905,8 @@ impl AptosVM {
                     txn_data,
                     gas_meter.balance().into(),
                     fee_statement,
+                    module_storage,
+                    traversal_context,
                 )
             } else {
                 transaction_validation::run_success_epilogue(
@@ -3137,7 +3141,7 @@ impl AptosVM {
 
         // For native-dispatched transactions, use the native prologue to avoid Move VM overhead.
         if crate::native_dispatch::is_native_dispatched_txn(txn_data) {
-            crate::native_dispatch::run_native_prologue(session, txn_data)?;
+            crate::native_dispatch::run_native_prologue(session, txn_data, module_storage, traversal_context)?;
         } else {
             // Runs script prologue for all transaction types including multisig
             transaction_validation::run_script_prologue(

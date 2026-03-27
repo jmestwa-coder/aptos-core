@@ -5131,50 +5131,11 @@ fn increment_volume_in_window(entry: &bytes::Bytes, delta: u128) -> bytes::Bytes
 // Native prologue/epilogue for native-dispatched transactions
 // ---------------------------------------------------------------------------
 
-use aptos_types::transaction::authenticator::AuthenticationKey;
 use aptos_types::fee_statement::FeeStatement;
 use crate::transaction_metadata::TransactionMetadata;
 use aptos_types::transaction::ReplayProtector;
-
-/// Address of the APT fungible asset metadata object (0xA).
-#[allow(dead_code)]
-const APT_METADATA_ADDRESS: AccountAddress = {
-    let mut bytes = [0u8; AccountAddress::LENGTH];
-    bytes[AccountAddress::LENGTH - 1] = 0x0A;
-    AccountAddress::new(bytes)
-};
-
-/// Compute the primary fungible store address for an account's APT balance.
-///
-/// This matches the Move logic: `object::create_user_derived_object_address(account, @aptos_fungible_asset)`
-/// which computes `sha3_256(account || 0xA || DeriveObjectAddressFromObject_scheme)`.
-#[allow(dead_code)]
-fn apt_primary_store_address(account: &AccountAddress) -> AccountAddress {
-    AuthenticationKey::object_address_from_object(account, &APT_METADATA_ADDRESS)
-        .account_address()
-}
-
-/// ObjectGroup struct tag for resource group member reads.
-#[allow(dead_code)]
-fn object_group_tag() -> StructTag {
-    StructTag {
-        address: AccountAddress::ONE,
-        module: Identifier::new("object").unwrap(),
-        name: Identifier::new("ObjectGroup").unwrap(),
-        type_args: vec![],
-    }
-}
-
-/// FungibleStore struct tag.
-#[allow(dead_code)]
-fn fungible_store_tag() -> StructTag {
-    StructTag {
-        address: AccountAddress::ONE,
-        module: Identifier::new("fungible_asset").unwrap(),
-        name: Identifier::new("FungibleStore").unwrap(),
-        type_args: vec![],
-    }
-}
+use move_vm_runtime::ModuleStorage;
+use move_vm_types::gas::UnmeteredGasMeter;
 
 /// Account struct tag.
 fn account_tag() -> StructTag {
@@ -5196,25 +5157,16 @@ fn chain_id_tag() -> StructTag {
     }
 }
 
-// BCS-compatible struct definitions for framework resources
-// These must match the exact field order in the Move structs.
+// BCS-compatible struct definitions for framework resources.
 
-/// Move: `0x1::account::Account`
-/// Fields: authentication_key, sequence_number, guid_creation_num,
-///         coin_register_events, key_rotation_events,
-///         rotation_capability_offer, signer_capability_offer
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AccountResource {
     authentication_key: Vec<u8>,
     sequence_number: u64,
     guid_creation_num: u64,
-    // EventHandle<CoinRegisterEvent>: { counter: u64, guid: GUID { id: ID { creation_num: u64, addr: address } } }
     coin_register_events: EventHandle,
-    // EventHandle<KeyRotationEvent>
     key_rotation_events: EventHandle,
-    // CapabilityOffer<RotationCapability>: { for: Option<address> }
     rotation_capability_offer: CapabilityOffer,
-    // CapabilityOffer<SignerCapability>: { for: Option<address> }
     signer_capability_offer: CapabilityOffer,
 }
 
@@ -5241,27 +5193,12 @@ struct CapabilityOffer {
     for_address: Option<AccountAddress>,
 }
 
-/// Move: `0x1::chain_id::ChainId`
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ChainIdResource {
     id: u8,
 }
 
-/// Move: `0x1::fungible_asset::FungibleStore`
-/// Fields: metadata (Object<Metadata> is just an address), balance, frozen
-#[derive(serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-struct FungibleStoreResource {
-    #[allow(dead_code)]
-    metadata: AccountAddress, // Object<Metadata> serializes as address
-    #[allow(dead_code)]
-    balance: u64,
-    #[allow(dead_code)]
-    frozen: bool,
-}
-
 /// Checks if a transaction is a native-dispatched entry function.
-/// Uses the same NATIVE_DISPATCH env var and entry function check.
 pub(crate) fn is_native_dispatched_txn(txn_data: &TransactionMetadata) -> bool {
     use std::sync::OnceLock;
     static NATIVE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -5278,26 +5215,28 @@ pub(crate) fn is_native_dispatched_txn(txn_data: &TransactionMetadata) -> bool {
     }
 }
 
-/// Native prologue — replaces Move's `unified_prologue_v2` / `run_script_prologue`.
+/// Native prologue — hybrid: native checks + Move VM for nonce & gas balance.
 ///
-/// Validates:
-/// 1. Timestamp expiration
-/// 2. Chain ID
-/// 3. Sequence number (sender Account)
-/// 4. Gas balance (FungibleStore at sender's APT primary store)
-///
-/// This ONLY reads resources (no writes), matching the Move prologue's behavior.
+/// 1. Timestamp expiration (native)
+/// 2. Chain ID (native)
+/// 3. Sequence number or nonce validation:
+///    - SequenceNumber: native check against Account resource
+///    - Nonce: calls Move `nonce_validation::check_and_insert_nonce` via VM
+/// 4. Gas balance: calls Move `fungible_asset::is_address_balance_at_least` via VM
+///    (required for ConcurrentFungibleBalance aggregator reads)
 pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
     txn_data: &TransactionMetadata,
+    module_storage: &impl ModuleStorage,
+    traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
 ) -> Result<(), VMStatus> {
     let sender = txn_data.sender;
-    let _gas_payer = txn_data.fee_payer.unwrap_or(sender);
+    let gas_payer = txn_data.fee_payer.unwrap_or(sender);
+
     // 1. Timestamp check: now_seconds() < txn_expiration_time
     let now_microseconds = native_session_helpers::read_timestamp_microseconds(session)?;
     let now_seconds = now_microseconds / 1_000_000;
     if now_seconds >= txn_data.expiration_timestamp_secs {
-        // PROLOGUE_ETRANSACTION_EXPIRED = 5, error::invalid_argument(5) = 0x10005 = 65541
         return Err(VMStatus::error(
             StatusCode::TRANSACTION_EXPIRED,
             Some("Native prologue: transaction expired".to_string()),
@@ -5320,7 +5259,7 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
         ));
     }
 
-    // 3. Sequence number check (only for sequence-number-based replay protection)
+    // 3. Replay protection
     match txn_data.replay_protector {
         ReplayProtector::SequenceNumber(txn_seq) => {
             let account_res: AccountResource = native_session_helpers::read_resource(
@@ -5357,47 +5296,105 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
                 ));
             }
         },
-        ReplayProtector::Nonce(_) => {
-            // For orderless transactions, we skip the nonce validation (check_and_insert_nonce)
-            // in the native prologue. This avoids the expensive Move VM call into
-            // nonce_validation module. The benchmark doesn't need replay protection.
-            // We still read the Account resource to match the read set for Block-STM.
-            let _account: Option<AccountResource> = native_session_helpers::read_resource(
-                session, &sender, &account_tag(),
-            )?;
+        ReplayProtector::Nonce(nonce) => {
+            // Orderless txns: validate expiration not too far in the future
+            let max_exp = now_seconds + 100; // MAX_EXP_TIME_SECONDS_FOR_ORDERLESS_TXNS
+            if txn_data.expiration_timestamp_secs > max_exp {
+                return Err(VMStatus::error(
+                    StatusCode::TRANSACTION_EXPIRED,
+                    Some("Native prologue: orderless txn expiration too far in the future".to_string()),
+                ));
+            }
+
+            // Call Move VM for nonce validation — uses Table + BigOrderedMap state
+            // that cannot be replicated natively.
+            let nonce_module = move_core_types::language_storage::ModuleId::new(
+                AccountAddress::ONE,
+                Identifier::new("nonce_validation").unwrap(),
+            );
+            let result = session.execute_function_bypass_visibility(
+                &nonce_module,
+                &Identifier::new("check_and_insert_nonce").unwrap(),
+                vec![],
+                vec![
+                    bcs::to_bytes(&sender).unwrap(),
+                    bcs::to_bytes(&nonce).unwrap(),
+                    bcs::to_bytes(&txn_data.expiration_timestamp_secs).unwrap(),
+                ],
+                &mut UnmeteredGasMeter,
+                traversal_context,
+                module_storage,
+            ).map_err(|e| e.into_vm_status())?;
+
+            // check_and_insert_nonce returns bool — false means nonce already used
+            let return_values = result.return_values;
+            if !return_values.is_empty() {
+                let nonce_ok: bool = bcs::from_bytes(&return_values[0].0).unwrap_or(false);
+                if !nonce_ok {
+                    return Err(VMStatus::error(
+                        StatusCode::SEQUENCE_NUMBER_TOO_OLD,
+                        Some("Native prologue: nonce already used".to_string()),
+                    ));
+                }
+            }
         },
     }
 
-    // 4. Gas balance check
-    // Skip gas balance check in native prologue. The benchmark accounts use
-    // ConcurrentFungibleBalance (aggregator-based balance), which cannot be read
-    // as a simple BCS resource. The Move prologue handles this through special
-    // aggregator APIs. Since the benchmark accounts always have sufficient APT,
-    // we skip this check for native-dispatched transactions.
-    // 
-    // NOTE: If this were for production, we would need to implement aggregator reads
-    // or call the Move VM for this specific check.
+    // 4. Gas balance check via Move VM — required for ConcurrentFungibleBalance
+    // aggregator reads to register Block-STM dependencies correctly.
+    let gas_amount = u64::from(txn_data.gas_unit_price) * u64::from(txn_data.max_gas_amount);
+    if gas_amount > 0 {
+        let fa_module = move_core_types::language_storage::ModuleId::new(
+            AccountAddress::ONE,
+            Identifier::new("aptos_account").unwrap(),
+        );
+        let result = session.execute_function_bypass_visibility(
+            &fa_module,
+            &Identifier::new("is_fungible_balance_at_least").unwrap(),
+            vec![],
+            vec![
+                bcs::to_bytes(&gas_payer).unwrap(),
+                bcs::to_bytes(&gas_amount).unwrap(),
+            ],
+            &mut UnmeteredGasMeter,
+            traversal_context,
+            module_storage,
+        ).map_err(|e| e.into_vm_status())?;
+
+        let return_values = result.return_values;
+        if !return_values.is_empty() {
+            let has_balance: bool = bcs::from_bytes(&return_values[0].0).unwrap_or(false);
+            if !has_balance {
+                return Err(VMStatus::error(
+                    StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
+                    Some("Native prologue: insufficient gas balance".to_string()),
+                ));
+            }
+        }
+    }
 
     Ok(())
 }
 
-/// Native epilogue — replaces Move's `unified_epilogue_v2`.
+/// Native epilogue — hybrid: Move VM for gas fee burn + native seq num & events.
 ///
-/// 1. Computes gas fee
-/// 2. Burns/mints APT in the gas payer's FungibleStore
-/// 3. Increments sender's sequence number
-/// 4. Emits FeeStatement event
+/// 1. Gas fee calculation (native)
+/// 2. Gas fee burn/refund via Move `transaction_fee::burn_fee` / `mint_and_refund`
+/// 3. Sequence number increment (native, for non-orderless txns)
+/// 4. FeeStatement event emission (native)
 pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
     txn_data: &TransactionMetadata,
     gas_remaining: u64,
     fee_statement: FeeStatement,
+    module_storage: &impl ModuleStorage,
+    traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
 ) -> Result<(), VMStatus> {
     let sender = txn_data.sender;
-    let _gas_payer = txn_data.fee_payer.unwrap_or(sender);
+    let gas_payer = txn_data.fee_payer.unwrap_or(sender);
     let gas_price = u64::from(txn_data.gas_unit_price);
     let max_gas = u64::from(txn_data.max_gas_amount);
-    let _storage_fee_refund = fee_statement.storage_fee_refund();
+    let storage_fee_refund = fee_statement.storage_fee_refund();
 
     // Validate gas accounting
     if max_gas < gas_remaining {
@@ -5415,19 +5412,43 @@ pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
             Some("Native epilogue: fee overflow".to_string()),
         ));
     }
-    let _transaction_fee = gas_price * gas_used;
+    let transaction_fee = gas_price * gas_used;
 
-    // Fee adjustment in FungibleStore
-    // The benchmark accounts use ConcurrentFungibleBalance (aggregator-based balance).
-    // The Move epilogue handles fee burn/mint through special aggregator APIs
-    // (address_burn_from_for_gas / unchecked_deposit_with_no_events).
-    // We cannot replicate this natively without aggregator support.
-    //
-    // For the benchmark, we skip the FungibleStore modification entirely.
-    // This means gas fees are not actually charged, but since the benchmark
-    // is measuring throughput (not gas accuracy), this is acceptable.
-    //
-    // NOTE: For production, this would need proper aggregator read/write support.
+    // Gas fee burn/refund via Move VM — uses ConcurrentFungibleBalance aggregators
+    let txn_fee_module = move_core_types::language_storage::ModuleId::new(
+        AccountAddress::ONE,
+        Identifier::new("transaction_fee").unwrap(),
+    );
+
+    if transaction_fee > storage_fee_refund {
+        let burn_amount = transaction_fee - storage_fee_refund;
+        session.execute_function_bypass_visibility(
+            &txn_fee_module,
+            &Identifier::new("burn_fee").unwrap(),
+            vec![],
+            vec![
+                bcs::to_bytes(&gas_payer).unwrap(),
+                bcs::to_bytes(&burn_amount).unwrap(),
+            ],
+            &mut UnmeteredGasMeter,
+            traversal_context,
+            module_storage,
+        ).map_err(|e| e.into_vm_status())?;
+    } else if transaction_fee < storage_fee_refund {
+        let mint_amount = storage_fee_refund - transaction_fee;
+        session.execute_function_bypass_visibility(
+            &txn_fee_module,
+            &Identifier::new("mint_and_refund").unwrap(),
+            vec![],
+            vec![
+                bcs::to_bytes(&gas_payer).unwrap(),
+                bcs::to_bytes(&mint_amount).unwrap(),
+            ],
+            &mut UnmeteredGasMeter,
+            traversal_context,
+            module_storage,
+        ).map_err(|e| e.into_vm_status())?;
+    }
 
     // Increment sequence number (only for non-orderless txns)
     if !txn_data.is_orderless() {
