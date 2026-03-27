@@ -5198,6 +5198,66 @@ struct ChainIdResource {
     id: u8,
 }
 
+// BCS-compatible struct definitions for nonce validation.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NonceHistory {
+    nonce_table_handle: AccountAddress, // Table<u64, Bucket> serializes as just a handle (address)
+    next_key: u64,
+}
+
+fn nonce_history_tag() -> StructTag {
+    StructTag {
+        address: AccountAddress::ONE,
+        module: Identifier::new("nonce_validation").unwrap(),
+        name: Identifier::new("NonceHistory").unwrap(),
+        type_args: vec![],
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+struct NonceKey {
+    sender_address: AccountAddress,
+    nonce: u64,
+}
+
+impl PartialOrd for NonceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NonceKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        bcs::to_bytes(self).unwrap().cmp(&bcs::to_bytes(other).unwrap())
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+struct NonceKeyWithExpTime {
+    txn_expiration_time: u64,
+    sender_address: AccountAddress,
+    nonce: u64,
+}
+
+impl PartialOrd for NonceKeyWithExpTime {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NonceKeyWithExpTime {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        bcs::to_bytes(self).unwrap().cmp(&bcs::to_bytes(other).unwrap())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct NonceBucketStruct {
+    nonces_ordered_by_exp_time: bcs_types::BigOrderedMap<NonceKeyWithExpTime, bool>,
+    nonce_to_exp_time_map: bcs_types::BigOrderedMap<NonceKey, u64>,
+}
+
 /// Checks if a transaction is a native-dispatched entry function.
 pub(crate) fn is_native_dispatched_txn(txn_data: &TransactionMetadata) -> bool {
     use std::sync::OnceLock;
@@ -5215,13 +5275,306 @@ pub(crate) fn is_native_dispatched_txn(txn_data: &TransactionMetadata) -> bool {
     }
 }
 
-/// Native prologue — hybrid: native checks + Move VM for nonce & gas balance.
+
+/// Native nonce validation — replaces Move VM call to `nonce_validation::check_and_insert_nonce`.
+///
+/// Returns `Ok(true)` if nonce is valid and was inserted, `Ok(false)` if nonce is already used.
+fn native_check_and_insert_nonce<R: AptosMoveResolver>(
+    session: &mut SessionExt<'_, R>,
+    sender: AccountAddress,
+    nonce: u64,
+    txn_expiration_time: u64,
+    now_seconds: u64,
+) -> Result<bool, VMStatus> {
+    use siphasher::sip::SipHasher;
+    use std::hash::Hasher;
+
+    let map_err = |e: String| -> VMStatus {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some(format!("native nonce validation: {}", e)),
+        )
+    };
+
+    // 1. Read NonceHistory resource from 0x1
+    let nonce_history_tag = nonce_history_tag();
+    let nonce_history: NonceHistory = native_session_helpers::read_resource(
+        session, &AccountAddress::ONE, &nonce_history_tag,
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some("native nonce validation: NonceHistory resource not found at 0x1".to_string()),
+        )
+    })?;
+    let nonce_table_handle = aptos_table_natives::TableHandle(nonce_history.nonce_table_handle);
+
+    // 2. Compute bucket_index = sip_hash(bcs(NonceKey{sender, nonce})) % 50000
+    let nonce_key = NonceKey { sender_address: sender, nonce };
+    let nonce_key_bytes = bcs::to_bytes(&nonce_key).map_err(|e| {
+        VMStatus::error(StatusCode::VALUE_SERIALIZATION_ERROR,
+            Some(format!("native nonce validation: serialize NonceKey: {}", e)))
+    })?;
+    let mut hasher = SipHasher::new();
+    hasher.write(&nonce_key_bytes);
+    let hash = hasher.finish();
+    let bucket_index: u64 = hash % 50000;
+
+    // 3. Read bucket from nonce_table
+    let bucket_key_bytes = bcs::to_bytes(&bucket_index).map_err(|e| {
+        VMStatus::error(StatusCode::VALUE_SERIALIZATION_ERROR,
+            Some(format!("native nonce validation: serialize bucket_index: {}", e)))
+    })?;
+    let is_new_bucket;
+    let bucket_bytes = native_session_helpers::read_table_item_bytes(
+        session, nonce_table_handle, &bucket_key_bytes,
+    )?;
+
+    let mut bucket: NonceBucketStruct = match bucket_bytes {
+        Some(b) => {
+            is_new_bucket = false;
+            bcs::from_bytes(&b).map_err(|e| {
+                VMStatus::error(StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+                    Some(format!("native nonce validation: deserialize NonceBucket: {}", e)))
+            })?
+        },
+        None => {
+            is_new_bucket = true;
+            // Create empty bucket with inline BigOrderedMaps (empty root, no table)
+            NonceBucketStruct {
+                nonces_ordered_by_exp_time: bcs_types::BigOrderedMap::BPlusTreeMap {
+                    root: bcs_types::Node::V1 {
+                        is_leaf: true,
+                        children: bcs_types::OrderedMap::SortedVectorMap { entries: vec![] },
+                        prev: 0,
+                        next: 0,
+                    },
+                    nodes: bcs_types::StorageSlotsAllocator::V1 {
+                        slots: None,
+                        new_slot_index: 10,
+                        should_reuse: false,
+                        reuse_head_index: 0,
+                        reuse_spare_count: 0,
+                        _phantom: std::marker::PhantomData,
+                    },
+                    min_leaf_index: 0,
+                    max_leaf_index: 0,
+                    constant_kv_size: true,
+                    inner_max_degree: 0,
+                    leaf_max_degree: 0,
+                    write_cache: std::collections::HashMap::new(),
+                },
+                nonce_to_exp_time_map: bcs_types::BigOrderedMap::BPlusTreeMap {
+                    root: bcs_types::Node::V1 {
+                        is_leaf: true,
+                        children: bcs_types::OrderedMap::SortedVectorMap { entries: vec![] },
+                        prev: 0,
+                        next: 0,
+                    },
+                    nodes: bcs_types::StorageSlotsAllocator::V1 {
+                        slots: None,
+                        new_slot_index: 10,
+                        should_reuse: false,
+                        reuse_head_index: 0,
+                        reuse_spare_count: 0,
+                        _phantom: std::marker::PhantomData,
+                    },
+                    min_leaf_index: 0,
+                    max_leaf_index: 0,
+                    constant_kv_size: true,
+                    inner_max_degree: 0,
+                    leaf_max_degree: 0,
+                    write_cache: std::collections::HashMap::new(),
+                },
+            }
+        },
+    };
+
+    // Collect all table writes to flush at the end
+    let mut all_table_writes: Vec<(aptos_table_natives::TableHandle, TableWrite)> = Vec::new();
+
+    // Build read_slot closures for the two BigOrderedMaps.
+    // These closures borrow `session` immutably (via reborrow) so we can still
+    // mutably borrow it later for writes.
+    let exp_time_handle = bucket.nonces_ordered_by_exp_time.get_table_handle()
+        .map(|th| aptos_table_natives::TableHandle(th.handle));
+    let nonce_map_handle = bucket.nonce_to_exp_time_map.get_table_handle()
+        .map(|th| aptos_table_natives::TableHandle(th.handle));
+
+    // We need write caches for read-after-write within multi-step operations
+    let exp_time_write_cache: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    let nonce_map_write_cache: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+
+    // Helper macro to collect writes from BigOrderedMap operations
+    macro_rules! collect_nonce_writes {
+        ($map:expr, $writes:expr, $cache:expr) => {
+            if let Some(th) = $map.get_table_handle() {
+                let handle = aptos_table_natives::TableHandle(th.handle);
+                for tw in $writes {
+                    if let Ok(key_bytes) = bcs::to_bytes(&tw.slot_index) {
+                        $cache.borrow_mut().insert(key_bytes, tw.data.clone());
+                    }
+                    all_table_writes.push((handle, tw));
+                }
+            }
+        };
+    }
+
+    // Perform all tree operations in a block that borrows session immutably,
+    // collecting writes to flush afterward.
+    {
+        let session_ref: &SessionExt<'_, R> = &*session;
+
+        let read_exp_time = |slot_index: u64| -> Result<Option<Vec<u8>>, String> {
+            match exp_time_handle {
+                Some(handle) => {
+                    let key_bytes = bcs::to_bytes(&slot_index)
+                        .map_err(|e| format!("serialize slot key: {}", e))?;
+                    if let Some(cached) = exp_time_write_cache.borrow().get(&key_bytes) {
+                        return Ok(Some(cached.clone()));
+                    }
+                    native_session_helpers::read_table_item_bytes(session_ref, handle, &key_bytes)
+                        .map(|opt| opt.map(|b| b.to_vec()))
+                        .map_err(|e| format!("read table item: {:?}", e))
+                },
+                None => Ok(None),
+            }
+        };
+
+        let read_nonce_map = |slot_index: u64| -> Result<Option<Vec<u8>>, String> {
+            match nonce_map_handle {
+                Some(handle) => {
+                    let key_bytes = bcs::to_bytes(&slot_index)
+                        .map_err(|e| format!("serialize slot key: {}", e))?;
+                    if let Some(cached) = nonce_map_write_cache.borrow().get(&key_bytes) {
+                        return Ok(Some(cached.clone()));
+                    }
+                    native_session_helpers::read_table_item_bytes(session_ref, handle, &key_bytes)
+                        .map(|opt| opt.map(|b| b.to_vec()))
+                        .map_err(|e| format!("read table item: {:?}", e))
+                },
+                None => Ok(None),
+            }
+        };
+
+        // 4. Check if nonce exists in nonce_to_exp_time_map
+        let existing_exp_time = bucket.nonce_to_exp_time_map.tree_get(&nonce_key, &read_nonce_map)
+            .map_err(map_err)?;
+
+        if let Some(old_exp_time) = existing_exp_time {
+            if old_exp_time >= now_seconds {
+                // Not expired -> nonce already used
+                return Ok(false);
+            }
+            // Expired, but check overlap invariant
+            if txn_expiration_time <= old_exp_time + 100 {
+                // Overlap invariant violated
+                return Ok(false);
+            }
+            // Expired and no overlap -> remove from both maps
+            let old_exp_key = NonceKeyWithExpTime {
+                txn_expiration_time: old_exp_time,
+                sender_address: sender,
+                nonce,
+            };
+            let (_, writes) = bucket.nonces_ordered_by_exp_time.tree_remove(&old_exp_key, &read_exp_time)
+                .map_err(map_err)?;
+            collect_nonce_writes!(bucket.nonces_ordered_by_exp_time, writes, &exp_time_write_cache);
+
+            let (_, writes) = bucket.nonce_to_exp_time_map.tree_remove(&nonce_key, &read_nonce_map)
+                .map_err(map_err)?;
+            collect_nonce_writes!(bucket.nonce_to_exp_time_map, writes, &nonce_map_write_cache);
+        }
+
+        // 5. GC up to 5 expired nonces
+        for _ in 0..5 {
+            if bucket.nonces_ordered_by_exp_time.is_empty() {
+                break;
+            }
+            let front = bucket.nonces_ordered_by_exp_time.tree_borrow_front(&read_exp_time)
+                .map_err(map_err)?;
+            match front {
+                Some((front_key, _)) => {
+                    if front_key.txn_expiration_time + 100 < now_seconds {
+                        // Expired: remove from both maps
+                        let (_, writes) = bucket.nonces_ordered_by_exp_time.tree_pop_front(&read_exp_time)
+                            .map_err(map_err)?;
+                        collect_nonce_writes!(bucket.nonces_ordered_by_exp_time, writes, &exp_time_write_cache);
+
+                        let gc_nonce_key = NonceKey {
+                            sender_address: front_key.sender_address,
+                            nonce: front_key.nonce,
+                        };
+                        let (_, writes) = bucket.nonce_to_exp_time_map.tree_remove(&gc_nonce_key, &read_nonce_map)
+                            .map_err(map_err)?;
+                        collect_nonce_writes!(bucket.nonce_to_exp_time_map, writes, &nonce_map_write_cache);
+                    } else {
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+
+        // 6. Insert into both maps
+        let exp_key = NonceKeyWithExpTime {
+            txn_expiration_time,
+            sender_address: sender,
+            nonce,
+        };
+        let writes = bucket.nonces_ordered_by_exp_time.tree_add(exp_key, true, &read_exp_time)
+            .map_err(map_err)?;
+        collect_nonce_writes!(bucket.nonces_ordered_by_exp_time, writes, &exp_time_write_cache);
+
+        let writes = bucket.nonce_to_exp_time_map.tree_add(nonce_key, txn_expiration_time, &read_nonce_map)
+            .map_err(map_err)?;
+        collect_nonce_writes!(bucket.nonce_to_exp_time_map, writes, &nonce_map_write_cache);
+    } // session_ref dropped here
+
+    // 7. Serialize bucket and write back to table
+    let bucket_bytes = bcs::to_bytes(&bucket).map_err(|e| {
+        VMStatus::error(StatusCode::VALUE_SERIALIZATION_ERROR,
+            Some(format!("native nonce validation: serialize NonceBucket: {}", e)))
+    })?;
+
+    if is_new_bucket {
+        native_session_helpers::create_table_item_bytes(
+            session, nonce_table_handle, &bucket_key_bytes, bucket_bytes.into(),
+        )?;
+    } else {
+        native_session_helpers::write_table_item_bytes(
+            session, nonce_table_handle, &bucket_key_bytes, bucket_bytes.into(),
+        )?;
+    }
+
+    // Flush all BigOrderedMap child node writes
+    for (handle, tw) in all_table_writes {
+        let key_bytes = bcs::to_bytes(&tw.slot_index).map_err(|e| {
+            VMStatus::error(StatusCode::VALUE_SERIALIZATION_ERROR,
+                Some(format!("native nonce validation: serialize slot key: {}", e)))
+        })?;
+        if tw.is_new {
+            native_session_helpers::create_table_item_bytes(
+                session, handle, &key_bytes, tw.data.into(),
+            )?;
+        } else {
+            native_session_helpers::write_table_item_bytes(
+                session, handle, &key_bytes, tw.data.into(),
+            )?;
+        }
+    }
+
+    Ok(true)
+}
+
+/// Native prologue — hybrid: native checks + Move VM for gas balance.
 ///
 /// 1. Timestamp expiration (native)
 /// 2. Chain ID (native)
 /// 3. Sequence number or nonce validation:
 ///    - SequenceNumber: native check against Account resource
-///    - Nonce: calls Move `nonce_validation::check_and_insert_nonce` via VM
+///    - Nonce: native nonce validation (replaces Move VM call)
 /// 4. Gas balance: calls Move `fungible_asset::is_address_balance_at_least` via VM
 ///    (required for ConcurrentFungibleBalance aggregator reads)
 pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
@@ -5306,36 +5659,15 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
                 ));
             }
 
-            // Call Move VM for nonce validation — uses Table + BigOrderedMap state
-            // that cannot be replicated natively.
-            let nonce_module = move_core_types::language_storage::ModuleId::new(
-                AccountAddress::ONE,
-                Identifier::new("nonce_validation").unwrap(),
-            );
-            let result = session.execute_function_bypass_visibility(
-                &nonce_module,
-                &Identifier::new("check_and_insert_nonce").unwrap(),
-                vec![],
-                vec![
-                    bcs::to_bytes(&sender).unwrap(),
-                    bcs::to_bytes(&nonce).unwrap(),
-                    bcs::to_bytes(&txn_data.expiration_timestamp_secs).unwrap(),
-                ],
-                &mut UnmeteredGasMeter,
-                traversal_context,
-                module_storage,
-            ).map_err(|e| e.into_vm_status())?;
-
-            // check_and_insert_nonce returns bool — false means nonce already used
-            let return_values = result.return_values;
-            if !return_values.is_empty() {
-                let nonce_ok: bool = bcs::from_bytes(&return_values[0].0).unwrap_or(false);
-                if !nonce_ok {
-                    return Err(VMStatus::error(
-                        StatusCode::SEQUENCE_NUMBER_TOO_OLD,
-                        Some("Native prologue: nonce already used".to_string()),
-                    ));
-                }
+            // Native nonce validation — replaces Move VM call
+            let nonce_ok = native_check_and_insert_nonce(
+                session, sender, nonce, txn_data.expiration_timestamp_secs, now_seconds,
+            )?;
+            if !nonce_ok {
+                return Err(VMStatus::error(
+                    StatusCode::SEQUENCE_NUMBER_TOO_OLD,
+                    Some("Native prologue: nonce already used".to_string()),
+                ));
             }
         },
     }
