@@ -663,8 +663,9 @@ pub enum StatusCode {
     TRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE = 44,
     INVALID_NUMBER_OF_AUTHENTICATION_PROOFS = 45,
 
-    // Reserved error code for future use
-    RESERVED_VALIDATION_ERROR_11 = 46,
+    // Transaction payload failed structural validation (identifier lengths, type arg
+    // count, type tag node count, or disallowed type tag variants).
+    MALFORMED_TRANSACTION_PAYLOAD = 46,
     RESERVED_VALIDATION_ERROR_12 = 47,
     RESERVED_VALIDATION_ERROR_13 = 48,
     RESERVED_VALIDATION_ERROR_14 = 49,
