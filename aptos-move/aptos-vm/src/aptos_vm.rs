@@ -840,18 +840,27 @@ impl AptosVM {
             status,
         );
         epilogue_session.execute(|session| {
-            transaction_validation::run_failure_epilogue(
-                session,
-                module_storage,
-                serialized_signers,
-                gas_meter.balance(),
-                fee_statement,
-                self.features(),
-                txn_data,
-                log_context,
-                traversal_context,
-                self.is_simulation,
-            )
+            if crate::native_dispatch::is_native_dispatched_txn(txn_data) {
+                crate::native_dispatch::run_native_epilogue(
+                    session,
+                    txn_data,
+                    gas_meter.balance().into(),
+                    fee_statement,
+                )
+            } else {
+                transaction_validation::run_failure_epilogue(
+                    session,
+                    module_storage,
+                    serialized_signers,
+                    gas_meter.balance(),
+                    fee_statement,
+                    self.features(),
+                    txn_data,
+                    log_context,
+                    traversal_context,
+                    self.is_simulation,
+                )
+            }
         })?;
         epilogue_session.finish(fee_statement, status, change_set_configs, module_storage)
     }
@@ -888,18 +897,27 @@ impl AptosVM {
             u64::from(epilogue_session.get_storage_fee_refund()),
         );
         epilogue_session.execute(|session| {
-            transaction_validation::run_success_epilogue(
-                session,
-                module_storage,
-                serialized_signers,
-                gas_meter.balance(),
-                fee_statement,
-                self.features(),
-                txn_data,
-                log_context,
-                traversal_context,
-                self.is_simulation,
-            )
+            if crate::native_dispatch::is_native_dispatched_txn(txn_data) {
+                crate::native_dispatch::run_native_epilogue(
+                    session,
+                    txn_data,
+                    gas_meter.balance().into(),
+                    fee_statement,
+                )
+            } else {
+                transaction_validation::run_success_epilogue(
+                    session,
+                    module_storage,
+                    serialized_signers,
+                    gas_meter.balance(),
+                    fee_statement,
+                    self.features(),
+                    txn_data,
+                    log_context,
+                    traversal_context,
+                    self.is_simulation,
+                )
+            }
         })?;
         let output = epilogue_session.finish(
             fee_statement,
@@ -3117,17 +3135,22 @@ impl AptosVM {
             ));
         }
 
-        // Runs script prologue for all transaction types including multisig
-        transaction_validation::run_script_prologue(
-            session,
-            module_storage,
-            serialized_signers,
-            txn_data,
-            self.features(),
-            log_context,
-            traversal_context,
-            self.is_simulation,
-        )?;
+        // For native-dispatched transactions, use the native prologue to avoid Move VM overhead.
+        if crate::native_dispatch::is_native_dispatched_txn(txn_data) {
+            crate::native_dispatch::run_native_prologue(session, txn_data)?;
+        } else {
+            // Runs script prologue for all transaction types including multisig
+            transaction_validation::run_script_prologue(
+                session,
+                module_storage,
+                serialized_signers,
+                txn_data,
+                self.features(),
+                log_context,
+                traversal_context,
+                self.is_simulation,
+            )?;
+        }
 
         if let Some(multisig_address) = extra_config.multisig_address() {
             // Once "simulation_enhancement" is enabled, the simulation path also validates the
