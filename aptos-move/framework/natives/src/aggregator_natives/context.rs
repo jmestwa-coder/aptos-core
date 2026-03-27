@@ -164,6 +164,45 @@ impl<'a> NativeAggregatorContext<'a> {
         })
     }
 
+
+    /// Check if an aggregator value is at least `amount` without modifying it.
+    pub fn is_at_least(&self, id: DelayedFieldID, max_value: u128, amount: u128) -> PartialVMResult<bool> {
+        let mut data = self.delayed_field_data.borrow_mut();
+        data.try_add_or_check_delta(
+            id,
+            max_value,
+            SignedU128::Negative(amount),
+            self.delayed_field_resolver,
+            false,
+        )
+    }
+
+    /// Attempt to subtract `amount` from an aggregator. Returns true if successful.
+    pub fn try_sub(&self, id: DelayedFieldID, max_value: u128, amount: u128) -> PartialVMResult<bool> {
+        let mut data = self.delayed_field_data.borrow_mut();
+        data.try_add_delta(
+            id,
+            max_value,
+            SignedU128::Negative(amount),
+            self.delayed_field_resolver,
+        )
+    }
+
+    /// Attempt to add `amount` to an aggregator. Returns true if successful.
+    pub fn try_add(&self, id: DelayedFieldID, max_value: u128, amount: u128) -> PartialVMResult<bool> {
+        let mut data = self.delayed_field_data.borrow_mut();
+        data.try_add_delta(
+            id,
+            max_value,
+            SignedU128::Positive(amount),
+            self.delayed_field_resolver,
+        )
+    }
+
+    /// Whether delayed field optimization is enabled.
+    pub fn is_delayed_field_optimization_enabled(&self) -> bool {
+        self.delayed_field_optimization_enabled
+    }
     #[cfg(test)]
     fn into_delayed_fields(self) -> BTreeMap<DelayedFieldID, DelayedChange<DelayedFieldID>> {
         let NativeAggregatorContext {

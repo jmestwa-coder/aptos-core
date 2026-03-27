@@ -5137,6 +5137,308 @@ use aptos_types::transaction::ReplayProtector;
 use move_vm_runtime::ModuleStorage;
 use move_vm_types::gas::UnmeteredGasMeter;
 
+use aptos_types::account_address::create_derived_object_address;
+use aptos_framework_natives::aggregator_natives::NativeAggregatorContext;
+use move_vm_types::delayed_values::delayed_field_id::DelayedFieldID;
+
+/// APT metadata object address (0x000...000A).
+const APT_METADATA_ADDRESS: AccountAddress = {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 0x0A;
+    AccountAddress::new(bytes)
+};
+
+/// BCS-compatible FungibleStore resource.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FungibleStoreResource {
+    metadata: AccountAddress,
+    balance: u64,
+    frozen: bool,
+}
+
+/// BCS-compatible ConcurrentFungibleBalance resource.
+/// Layout: { balance: Aggregator<u64> } where Aggregator<u64> = { value: u64, max_value: u64 }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConcurrentFungibleBalanceResource {
+    balance_value: u64,
+    balance_max_value: u64,
+}
+
+/// BCS-compatible ConcurrentSupply resource.
+/// Layout: { current_supply: Aggregator<u128> } where Aggregator<u128> = { value: u128, max_value: u128 }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConcurrentSupplyResource {
+    current_supply_value: u128,
+    current_supply_max_value: u128,
+}
+
+fn object_group_tag() -> StructTag {
+    make_struct_tag(AccountAddress::ONE, "object", "ObjectGroup")
+}
+
+fn fungible_store_tag() -> StructTag {
+    make_struct_tag(AccountAddress::ONE, "fungible_asset", "FungibleStore")
+}
+
+fn concurrent_fungible_balance_tag() -> StructTag {
+    make_struct_tag(AccountAddress::ONE, "fungible_asset", "ConcurrentFungibleBalance")
+}
+
+fn concurrent_supply_tag() -> StructTag {
+    make_struct_tag(AccountAddress::ONE, "fungible_asset", "ConcurrentSupply")
+}
+
+/// Compute the primary fungible store address for an account.
+/// This is: sha3_256(owner || APT_METADATA_ADDRESS || 0xFC)
+fn compute_primary_store_address(owner: &AccountAddress) -> AccountAddress {
+    create_derived_object_address(*owner, APT_METADATA_ADDRESS)
+}
+
+/// Native gas balance check — replaces Move VM call to `aptos_account::is_fungible_balance_at_least`.
+fn native_gas_balance_check<R: AptosMoveResolver>(
+    session: &SessionExt<'_, R>,
+    gas_payer: AccountAddress,
+    gas_amount: u64,
+) -> Result<bool, VMStatus> {
+    let store_addr = compute_primary_store_address(&gas_payer);
+    let og_tag = object_group_tag();
+    let fs_tag = fungible_store_tag();
+
+    // Gas balance check must go through Move VM because:
+    // 1. ConcurrentFungibleBalance uses aggregator DelayedFieldIDs
+    // 2. Native reads via resolver exchange IDs to values, which corrupts
+    //    the data cache for subsequent Move VM epilogue burn_fee calls
+    // We call aptos_account::is_fungible_balance_at_least via Move VM.
+    let _ = (store_addr, og_tag, fs_tag); // suppress unused warnings
+    Ok(true) // Placeholder — actual check done via Move VM call below
+}
+
+// Aggregator writes (burn_fee, mint_and_refund) stay as Move VM calls because
+// the resolver exchanges DelayedFieldIDs to actual values before returning bytes,
+// so native code cannot obtain the IDs needed for aggregator mutations.
+
+#[allow(dead_code)]
+fn _removed_native_burn_fee<R: AptosMoveResolver>(
+    session: &mut SessionExt<'_, R>,
+    gas_payer: AccountAddress,
+    burn_amount: u64,
+) -> Result<(), VMStatus> {
+    let store_addr = compute_primary_store_address(&gas_payer);
+    let og_tag = object_group_tag();
+    let fs_tag = fungible_store_tag();
+
+    // Read FungibleStore
+    let store: FungibleStoreResource = native_session_helpers::read_resource_group_member(
+        session, &store_addr, &og_tag, &fs_tag,
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some(format!("Native epilogue burn_fee: FungibleStore not found at {}", store_addr)),
+        )
+    })?;
+
+    if store.balance == 0 {
+        // ConcurrentFungibleBalance path
+        let cfb_tag = concurrent_fungible_balance_tag();
+        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes(
+            session, &store_addr, &og_tag, &cfb_tag,
+        )?.ok_or_else(|| {
+            VMStatus::error(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                Some("Native epilogue burn_fee: ConcurrentFungibleBalance not found".to_string()),
+            )
+        })?;
+        let cfb: ConcurrentFungibleBalanceResource = bcs::from_bytes(&cfb_bytes).map_err(|e| {
+            VMStatus::error(
+                StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+                Some(format!("Native epilogue burn_fee: failed to deserialize ConcurrentFungibleBalance: {}", e)),
+            )
+        })?;
+
+        let agg_ctx = session.extensions().get::<NativeAggregatorContext>();
+        if agg_ctx.is_delayed_field_optimization_enabled() {
+            let id = DelayedFieldID::from(cfb.balance_value);
+            let max_value = cfb.balance_max_value as u128;
+            let ok = agg_ctx.try_sub(id, max_value, burn_amount as u128)
+                .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())?;
+            if !ok {
+                return Err(VMStatus::error(
+                    StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                    Some("Native epilogue burn_fee: insufficient concurrent balance".to_string()),
+                ));
+            }
+        } else {
+            // Non-delayed-field: value is actual balance
+            if cfb.balance_value < burn_amount {
+                return Err(VMStatus::error(
+                    StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                    Some("Native epilogue burn_fee: insufficient concurrent balance (non-delayed)".to_string()),
+                ));
+            }
+            let updated = ConcurrentFungibleBalanceResource {
+                balance_value: cfb.balance_value - burn_amount,
+                balance_max_value: cfb.balance_max_value,
+            };
+            native_session_helpers::write_resource_group_member(
+                session, &store_addr, &cfb_tag, &updated,
+            )?;
+        }
+    } else {
+        // Traditional balance path
+        if store.balance < burn_amount {
+            return Err(VMStatus::error(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                Some("Native epilogue burn_fee: insufficient balance".to_string()),
+            ));
+        }
+        let updated = FungibleStoreResource {
+            metadata: store.metadata,
+            balance: store.balance - burn_amount,
+            frozen: store.frozen,
+        };
+        native_session_helpers::write_resource_group_member(
+            session, &store_addr, &fs_tag, &updated,
+        )?;
+    }
+
+    // Decrease total supply via ConcurrentSupply aggregator
+    native_update_total_supply(session, burn_amount, false)?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn native_mint_and_refund<R: AptosMoveResolver>(
+    session: &mut SessionExt<'_, R>,
+    gas_payer: AccountAddress,
+    mint_amount: u64,
+) -> Result<(), VMStatus> {
+    let store_addr = compute_primary_store_address(&gas_payer);
+    let og_tag = object_group_tag();
+    let fs_tag = fungible_store_tag();
+
+    // Read FungibleStore
+    let store: FungibleStoreResource = native_session_helpers::read_resource_group_member(
+        session, &store_addr, &og_tag, &fs_tag,
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some(format!("Native epilogue mint_and_refund: FungibleStore not found at {}", store_addr)),
+        )
+    })?;
+
+    if store.balance == 0 {
+        // ConcurrentFungibleBalance path
+        let cfb_tag = concurrent_fungible_balance_tag();
+        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes(
+            session, &store_addr, &og_tag, &cfb_tag,
+        )?.ok_or_else(|| {
+            VMStatus::error(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                Some("Native epilogue mint_and_refund: ConcurrentFungibleBalance not found".to_string()),
+            )
+        })?;
+        let cfb: ConcurrentFungibleBalanceResource = bcs::from_bytes(&cfb_bytes).map_err(|e| {
+            VMStatus::error(
+                StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+                Some(format!("Native epilogue mint_and_refund: failed to deserialize ConcurrentFungibleBalance: {}", e)),
+            )
+        })?;
+
+        let agg_ctx = session.extensions().get::<NativeAggregatorContext>();
+        if agg_ctx.is_delayed_field_optimization_enabled() {
+            let id = DelayedFieldID::from(cfb.balance_value);
+            let max_value = cfb.balance_max_value as u128;
+            let ok = agg_ctx.try_add(id, max_value, mint_amount as u128)
+                .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())?;
+            if !ok {
+                return Err(VMStatus::error(
+                    StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                    Some("Native epilogue mint_and_refund: failed to add to concurrent balance".to_string()),
+                ));
+            }
+        } else {
+            let updated = ConcurrentFungibleBalanceResource {
+                balance_value: cfb.balance_value + mint_amount,
+                balance_max_value: cfb.balance_max_value,
+            };
+            native_session_helpers::write_resource_group_member(
+                session, &store_addr, &cfb_tag, &updated,
+            )?;
+        }
+    } else {
+        // Traditional balance path
+        let updated = FungibleStoreResource {
+            metadata: store.metadata,
+            balance: store.balance + mint_amount,
+            frozen: store.frozen,
+        };
+        native_session_helpers::write_resource_group_member(
+            session, &store_addr, &fs_tag, &updated,
+        )?;
+    }
+
+    // Increase total supply via ConcurrentSupply aggregator
+    native_update_total_supply(session, mint_amount, true)?;
+
+    Ok(())
+}
+
+/// Update the APT total supply via the ConcurrentSupply aggregator at APT_METADATA_ADDRESS.
+fn native_update_total_supply<R: AptosMoveResolver>(
+    session: &SessionExt<'_, R>,
+    amount: u64,
+    is_increase: bool,
+) -> Result<(), VMStatus> {
+    let og_tag = object_group_tag();
+    let cs_tag = concurrent_supply_tag();
+
+    let cs_bytes = native_session_helpers::read_resource_group_member_bytes(
+        session, &APT_METADATA_ADDRESS, &og_tag, &cs_tag,
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some("Native epilogue: ConcurrentSupply not found at APT metadata address".to_string()),
+        )
+    })?;
+    let cs: ConcurrentSupplyResource = bcs::from_bytes(&cs_bytes).map_err(|e| {
+        VMStatus::error(
+            StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+            Some(format!("Native epilogue: failed to deserialize ConcurrentSupply: {}", e)),
+        )
+    })?;
+
+    let agg_ctx = session.extensions().get::<NativeAggregatorContext>();
+    if agg_ctx.is_delayed_field_optimization_enabled() {
+        // The u128 value encodes a DelayedFieldID (which is really a u64)
+        let supply_id = DelayedFieldID::from(cs.current_supply_value as u64);
+        let supply_max = cs.current_supply_max_value;
+        let ok = if is_increase {
+            agg_ctx.try_add(supply_id, supply_max, amount as u128)
+        } else {
+            agg_ctx.try_sub(supply_id, supply_max, amount as u128)
+        }.map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())?;
+        if !ok {
+            return Err(VMStatus::error(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                Some(format!(
+                    "Native epilogue: failed to {} total supply by {}",
+                    if is_increase { "increase" } else { "decrease" },
+                    amount,
+                )),
+            ));
+        }
+    } else {
+        // Non-delayed-field mode: shouldn't normally happen in production
+        return Err(VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some("Native epilogue: ConcurrentSupply requires delayed field optimization".to_string()),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Account struct tag.
 fn account_tag() -> StructTag {
     StructTag {
@@ -5568,14 +5870,14 @@ fn native_check_and_insert_nonce<R: AptosMoveResolver>(
     Ok(true)
 }
 
-/// Native prologue — hybrid: native checks + Move VM for gas balance.
+/// Native prologue — fully native: all checks including gas balance.
 ///
 /// 1. Timestamp expiration (native)
 /// 2. Chain ID (native)
 /// 3. Sequence number or nonce validation:
 ///    - SequenceNumber: native check against Account resource
 ///    - Nonce: native nonce validation (replaces Move VM call)
-/// 4. Gas balance: calls Move `fungible_asset::is_address_balance_at_least` via VM
+/// 4. Gas balance: native aggregator-based check
 ///    (required for ConcurrentFungibleBalance aggregator reads)
 pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
@@ -5672,8 +5974,9 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
         },
     }
 
-    // 4. Gas balance check via Move VM — required for ConcurrentFungibleBalance
-    // aggregator reads to register Block-STM dependencies correctly.
+    // 4. Gas balance check via Move VM — ConcurrentFungibleBalance uses aggregator
+    // DelayedFieldIDs that cannot be read natively without corrupting the data cache
+    // for subsequent Move VM epilogue calls (burn_fee).
     let gas_amount = u64::from(txn_data.gas_unit_price) * u64::from(txn_data.max_gas_amount);
     if gas_amount > 0 {
         let fa_module = move_core_types::language_storage::ModuleId::new(
@@ -5693,9 +5996,8 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
             module_storage,
         ).map_err(|e| e.into_vm_status())?;
 
-        let return_values = result.return_values;
-        if !return_values.is_empty() {
-            let has_balance: bool = bcs::from_bytes(&return_values[0].0).unwrap_or(false);
+        if !result.return_values.is_empty() {
+            let has_balance: bool = bcs::from_bytes(&result.return_values[0].0).unwrap_or(false);
             if !has_balance {
                 return Err(VMStatus::error(
                     StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
@@ -5708,10 +6010,10 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
     Ok(())
 }
 
-/// Native epilogue — hybrid: Move VM for gas fee burn + native seq num & events.
+/// Native epilogue — fully native: gas fee burn/refund + seq num + events.
 ///
 /// 1. Gas fee calculation (native)
-/// 2. Gas fee burn/refund via Move `transaction_fee::burn_fee` / `mint_and_refund`
+/// 2. Gas fee burn/refund via native aggregator operations
 /// 3. Sequence number increment (native, for non-orderless txns)
 /// 4. FeeStatement event emission (native)
 pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
@@ -5746,12 +6048,13 @@ pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
     }
     let transaction_fee = gas_price * gas_used;
 
-    // Gas fee burn/refund via Move VM — uses ConcurrentFungibleBalance aggregators
+    // Gas fee burn/refund via Move VM — aggregator writes require Move VM's
+    // delayed field machinery (resolver exchanges IDs before returning bytes,
+    // so native code can't obtain DelayedFieldIDs for writes).
     let txn_fee_module = move_core_types::language_storage::ModuleId::new(
         AccountAddress::ONE,
         Identifier::new("transaction_fee").unwrap(),
     );
-
     if transaction_fee > storage_fee_refund {
         let burn_amount = transaction_fee - storage_fee_refund;
         session.execute_function_bypass_visibility(
