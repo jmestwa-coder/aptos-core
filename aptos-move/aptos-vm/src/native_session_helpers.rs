@@ -30,6 +30,7 @@ use bytes::Bytes;
 use move_core_types::{
     account_address::AccountAddress,
     language_storage::{StructTag, TypeTag},
+    value::MoveTypeLayout,
     vm_status::StatusCode,
 };
 use aptos_table_natives::TableHandle;
@@ -286,6 +287,29 @@ pub fn read_resource_group_member_bytes<R: AptosMoveResolver>(
     let group_key = aptos_types::state_store::state_key::StateKey::resource_group(address, group_tag);
     let view = session.resolver().as_resource_group_view();
     view.get_resource_from_group(&group_key, resource_tag, None)
+        .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())
+}
+
+/// Reads a resource group member's raw bytes from storage, with a layout
+/// that triggers delayed field exchange.
+///
+/// When a `MoveTypeLayout` containing `Native(IdentifierMappingKind::Aggregator, ...)`
+/// markers is provided, the resolver performs the delayed field exchange: actual
+/// aggregator values are replaced with DelayedFieldIDs in the returned bytes.
+/// This allows native code to extract IDs for aggregator operations (try_add,
+/// try_sub, is_at_least) via the NativeAggregatorContext.
+///
+/// Returns `Ok(Some(bytes))` if the member exists (with IDs exchanged), `Ok(None)` if not.
+pub fn read_resource_group_member_bytes_with_layout<R: AptosMoveResolver>(
+    session: &SessionExt<'_, R>,
+    address: &AccountAddress,
+    group_tag: &StructTag,
+    resource_tag: &StructTag,
+    layout: &MoveTypeLayout,
+) -> Result<Option<Bytes>, VMStatus> {
+    let group_key = aptos_types::state_store::state_key::StateKey::resource_group(address, group_tag);
+    let view = session.resolver().as_resource_group_view();
+    view.get_resource_from_group(&group_key, resource_tag, Some(layout))
         .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())
 }
 

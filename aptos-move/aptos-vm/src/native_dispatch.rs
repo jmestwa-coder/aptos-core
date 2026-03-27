@@ -5135,11 +5135,11 @@ use aptos_types::fee_statement::FeeStatement;
 use crate::transaction_metadata::TransactionMetadata;
 use aptos_types::transaction::ReplayProtector;
 use move_vm_runtime::ModuleStorage;
-use move_vm_types::gas::UnmeteredGasMeter;
 
 use aptos_types::account_address::create_derived_object_address;
 use aptos_framework_natives::aggregator_natives::NativeAggregatorContext;
 use move_vm_types::delayed_values::delayed_field_id::DelayedFieldID;
+use move_core_types::value::{IdentifierMappingKind, MoveTypeLayout, MoveStructLayout};
 
 /// APT metadata object address (0x000...000A).
 const APT_METADATA_ADDRESS: AccountAddress = {
@@ -5188,6 +5188,31 @@ fn concurrent_supply_tag() -> StructTag {
     make_struct_tag(AccountAddress::ONE, "fungible_asset", "ConcurrentSupply")
 }
 
+/// MoveTypeLayout for ConcurrentFungibleBalance: { balance: Aggregator<u64> }
+/// Aggregator<u64> is a struct with two fields: value (u64, exchangeable) and max_value (u64).
+/// The value field is tagged with Native(Aggregator, U64) to trigger delayed field exchange.
+fn concurrent_fungible_balance_layout() -> MoveTypeLayout {
+    MoveTypeLayout::new_struct(MoveStructLayout::new(vec![
+        // balance: Aggregator<u64>
+        MoveTypeLayout::new_struct(MoveStructLayout::new(vec![
+            MoveTypeLayout::Native(IdentifierMappingKind::Aggregator, Box::new(MoveTypeLayout::U64)),  // value
+            MoveTypeLayout::U64,  // max_value
+        ])),
+    ]))
+}
+
+/// MoveTypeLayout for ConcurrentSupply: { current_supply: Aggregator<u128> }
+/// Aggregator<u128> has value (u128, exchangeable) and max_value (u128).
+fn concurrent_supply_layout() -> MoveTypeLayout {
+    MoveTypeLayout::new_struct(MoveStructLayout::new(vec![
+        // current_supply: Aggregator<u128>
+        MoveTypeLayout::new_struct(MoveStructLayout::new(vec![
+            MoveTypeLayout::Native(IdentifierMappingKind::Aggregator, Box::new(MoveTypeLayout::U128)),  // value
+            MoveTypeLayout::U128,  // max_value
+        ])),
+    ]))
+}
+
 /// Compute the primary fungible store address for an account.
 /// This is: sha3_256(owner || APT_METADATA_ADDRESS || 0xFC)
 fn compute_primary_store_address(owner: &AccountAddress) -> AccountAddress {
@@ -5195,6 +5220,10 @@ fn compute_primary_store_address(owner: &AccountAddress) -> AccountAddress {
 }
 
 /// Native gas balance check — replaces Move VM call to `aptos_account::is_fungible_balance_at_least`.
+///
+/// Reads FungibleStore to check direct balance, then falls through to
+/// ConcurrentFungibleBalance with layout-aware read to obtain DelayedFieldIDs
+/// for aggregator-based balance checking via `is_at_least`.
 fn native_gas_balance_check<R: AptosMoveResolver>(
     session: &SessionExt<'_, R>,
     gas_payer: AccountAddress,
@@ -5204,21 +5233,53 @@ fn native_gas_balance_check<R: AptosMoveResolver>(
     let og_tag = object_group_tag();
     let fs_tag = fungible_store_tag();
 
-    // Gas balance check must go through Move VM because:
-    // 1. ConcurrentFungibleBalance uses aggregator DelayedFieldIDs
-    // 2. Native reads via resolver exchange IDs to values, which corrupts
-    //    the data cache for subsequent Move VM epilogue burn_fee calls
-    // We call aptos_account::is_fungible_balance_at_least via Move VM.
-    let _ = (store_addr, og_tag, fs_tag); // suppress unused warnings
-    Ok(true) // Placeholder — actual check done via Move VM call below
+    // Read FungibleStore (no aggregators, plain read is fine)
+    let store: FungibleStoreResource = native_session_helpers::read_resource_group_member(
+        session, &store_addr, &og_tag, &fs_tag,
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some(format!("Native gas balance check: FungibleStore not found at {}", store_addr)),
+        )
+    })?;
+
+    // If the direct balance covers gas, we're done
+    if store.balance >= gas_amount {
+        return Ok(true);
+    }
+
+    // Otherwise check ConcurrentFungibleBalance via aggregator
+    let cfb_tag = concurrent_fungible_balance_tag();
+    let cfb_bytes = native_session_helpers::read_resource_group_member_bytes_with_layout(
+        session, &store_addr, &og_tag, &cfb_tag, &concurrent_fungible_balance_layout(),
+    )?.ok_or_else(|| {
+        VMStatus::error(
+            StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            Some("Native gas balance check: ConcurrentFungibleBalance not found".to_string()),
+        )
+    })?;
+    let cfb: ConcurrentFungibleBalanceResource = bcs::from_bytes(&cfb_bytes).map_err(|e| {
+        VMStatus::error(
+            StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+            Some(format!("Native gas balance check: failed to deserialize ConcurrentFungibleBalance: {}", e)),
+        )
+    })?;
+
+    let agg_ctx = session.extensions().get::<NativeAggregatorContext>();
+    if agg_ctx.is_delayed_field_optimization_enabled() {
+        // After layout-aware exchange, balance_value contains the DelayedFieldID
+        let id = DelayedFieldID::from(cfb.balance_value);
+        let max_value = cfb.balance_max_value as u128;
+        let has_enough = agg_ctx.is_at_least(id, max_value, gas_amount as u128)
+            .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined).into_vm_status())?;
+        Ok(has_enough)
+    } else {
+        // Non-delayed-field mode: balance_value is the actual balance
+        Ok(cfb.balance_value >= gas_amount)
+    }
 }
 
-// Aggregator writes (burn_fee, mint_and_refund) stay as Move VM calls because
-// the resolver exchanges DelayedFieldIDs to actual values before returning bytes,
-// so native code cannot obtain the IDs needed for aggregator mutations.
-
-#[allow(dead_code)]
-fn _removed_native_burn_fee<R: AptosMoveResolver>(
+fn native_burn_fee<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
     gas_payer: AccountAddress,
     burn_amount: u64,
@@ -5238,10 +5299,11 @@ fn _removed_native_burn_fee<R: AptosMoveResolver>(
     })?;
 
     if store.balance == 0 {
-        // ConcurrentFungibleBalance path
+        // ConcurrentFungibleBalance path — layout-aware read triggers delayed field exchange,
+        // so balance_value will contain the DelayedFieldID rather than the actual value.
         let cfb_tag = concurrent_fungible_balance_tag();
-        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes(
-            session, &store_addr, &og_tag, &cfb_tag,
+        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes_with_layout(
+            session, &store_addr, &og_tag, &cfb_tag, &concurrent_fungible_balance_layout(),
         )?.ok_or_else(|| {
             VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
@@ -5307,7 +5369,6 @@ fn _removed_native_burn_fee<R: AptosMoveResolver>(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn native_mint_and_refund<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
     gas_payer: AccountAddress,
@@ -5328,10 +5389,10 @@ fn native_mint_and_refund<R: AptosMoveResolver>(
     })?;
 
     if store.balance == 0 {
-        // ConcurrentFungibleBalance path
+        // ConcurrentFungibleBalance path — layout-aware read triggers delayed field exchange
         let cfb_tag = concurrent_fungible_balance_tag();
-        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes(
-            session, &store_addr, &og_tag, &cfb_tag,
+        let cfb_bytes = native_session_helpers::read_resource_group_member_bytes_with_layout(
+            session, &store_addr, &og_tag, &cfb_tag, &concurrent_fungible_balance_layout(),
         )?.ok_or_else(|| {
             VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
@@ -5393,8 +5454,8 @@ fn native_update_total_supply<R: AptosMoveResolver>(
     let og_tag = object_group_tag();
     let cs_tag = concurrent_supply_tag();
 
-    let cs_bytes = native_session_helpers::read_resource_group_member_bytes(
-        session, &APT_METADATA_ADDRESS, &og_tag, &cs_tag,
+    let cs_bytes = native_session_helpers::read_resource_group_member_bytes_with_layout(
+        session, &APT_METADATA_ADDRESS, &og_tag, &cs_tag, &concurrent_supply_layout(),
     )?.ok_or_else(|| {
         VMStatus::error(
             StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
@@ -5882,8 +5943,8 @@ fn native_check_and_insert_nonce<R: AptosMoveResolver>(
 pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
     session: &mut SessionExt<'_, R>,
     txn_data: &TransactionMetadata,
-    module_storage: &impl ModuleStorage,
-    traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
+    _module_storage: &impl ModuleStorage,
+    _traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
 ) -> Result<(), VMStatus> {
     let sender = txn_data.sender;
     let gas_payer = txn_data.fee_payer.unwrap_or(sender);
@@ -5974,36 +6035,15 @@ pub(crate) fn run_native_prologue<R: AptosMoveResolver>(
         },
     }
 
-    // 4. Gas balance check via Move VM — ConcurrentFungibleBalance uses aggregator
-    // DelayedFieldIDs that cannot be read natively without corrupting the data cache
-    // for subsequent Move VM epilogue calls (burn_fee).
+    // 4. Gas balance check — fully native with layout-aware aggregator reads
     let gas_amount = u64::from(txn_data.gas_unit_price) * u64::from(txn_data.max_gas_amount);
     if gas_amount > 0 {
-        let fa_module = move_core_types::language_storage::ModuleId::new(
-            AccountAddress::ONE,
-            Identifier::new("aptos_account").unwrap(),
-        );
-        let result = session.execute_function_bypass_visibility(
-            &fa_module,
-            &Identifier::new("is_fungible_balance_at_least").unwrap(),
-            vec![],
-            vec![
-                bcs::to_bytes(&gas_payer).unwrap(),
-                bcs::to_bytes(&gas_amount).unwrap(),
-            ],
-            &mut UnmeteredGasMeter,
-            traversal_context,
-            module_storage,
-        ).map_err(|e| e.into_vm_status())?;
-
-        if !result.return_values.is_empty() {
-            let has_balance: bool = bcs::from_bytes(&result.return_values[0].0).unwrap_or(false);
-            if !has_balance {
-                return Err(VMStatus::error(
-                    StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
-                    Some("Native prologue: insufficient gas balance".to_string()),
-                ));
-            }
+        let has_balance = native_gas_balance_check(session, gas_payer, gas_amount)?;
+        if !has_balance {
+            return Err(VMStatus::error(
+                StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
+                Some("Native prologue: insufficient gas balance".to_string()),
+            ));
         }
     }
 
@@ -6021,8 +6061,8 @@ pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
     txn_data: &TransactionMetadata,
     gas_remaining: u64,
     fee_statement: FeeStatement,
-    module_storage: &impl ModuleStorage,
-    traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
+    _module_storage: &impl ModuleStorage,
+    _traversal_context: &mut move_vm_runtime::module_traversal::TraversalContext,
 ) -> Result<(), VMStatus> {
     let sender = txn_data.sender;
     let gas_payer = txn_data.fee_payer.unwrap_or(sender);
@@ -6048,41 +6088,13 @@ pub(crate) fn run_native_epilogue<R: AptosMoveResolver>(
     }
     let transaction_fee = gas_price * gas_used;
 
-    // Gas fee burn/refund via Move VM — aggregator writes require Move VM's
-    // delayed field machinery (resolver exchanges IDs before returning bytes,
-    // so native code can't obtain DelayedFieldIDs for writes).
-    let txn_fee_module = move_core_types::language_storage::ModuleId::new(
-        AccountAddress::ONE,
-        Identifier::new("transaction_fee").unwrap(),
-    );
+    // Gas fee burn/refund — fully native using layout-aware aggregator reads
     if transaction_fee > storage_fee_refund {
         let burn_amount = transaction_fee - storage_fee_refund;
-        session.execute_function_bypass_visibility(
-            &txn_fee_module,
-            &Identifier::new("burn_fee").unwrap(),
-            vec![],
-            vec![
-                bcs::to_bytes(&gas_payer).unwrap(),
-                bcs::to_bytes(&burn_amount).unwrap(),
-            ],
-            &mut UnmeteredGasMeter,
-            traversal_context,
-            module_storage,
-        ).map_err(|e| e.into_vm_status())?;
+        native_burn_fee(session, gas_payer, burn_amount)?;
     } else if transaction_fee < storage_fee_refund {
         let mint_amount = storage_fee_refund - transaction_fee;
-        session.execute_function_bypass_visibility(
-            &txn_fee_module,
-            &Identifier::new("mint_and_refund").unwrap(),
-            vec![],
-            vec![
-                bcs::to_bytes(&gas_payer).unwrap(),
-                bcs::to_bytes(&mint_amount).unwrap(),
-            ],
-            &mut UnmeteredGasMeter,
-            traversal_context,
-            module_storage,
-        ).map_err(|e| e.into_vm_status())?;
+        native_mint_and_refund(session, gas_payer, mint_amount)?;
     }
 
     // Increment sequence number (only for non-orderless txns)
