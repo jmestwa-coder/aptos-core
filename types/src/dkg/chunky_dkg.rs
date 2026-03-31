@@ -18,7 +18,7 @@ use aptos_batch_encryption::{
     group::{Fr, G2Affine, Pairing},
     shared::{digest::DigestKey, encryption_key::EncryptionKey},
 };
-use aptos_crypto::{bls12381, weighted_config::WeightedConfigArkworks, TSecretSharingConfig};
+use aptos_crypto::{bls12381, weighted_config::WeightedConfigArkworks};
 use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
 use aptos_dkg::pvss::{
     chunky::{
@@ -60,6 +60,105 @@ pub static TEST_DIGEST_KEY: Lazy<Arc<DigestKey>> = Lazy::new(|| {
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(100u64);
     Arc::new(DigestKey::new(&mut rng, 32, 200).expect("DigestKey creation should not fail"))
 });
+/// Shared test PublicParameters for chunky DKG (unit tests only).
+pub static TEST_PUBLIC_PARAMETERS: Lazy<Arc<ChunkyDKGPublicParameters>> = Lazy::new(|| {
+    let mut rng = StdRng::seed_from_u64(200u64);
+    Arc::new(PublicParameters::new_with_commitment_base(
+        100,
+        aptos_dkg::pvss::chunky::DEFAULT_ELL_FOR_DEPLOYMENT,
+        100,
+        G2Affine::generator(),
+        &mut rng,
+    ))
+});
+
+/// Path to the BCS-serialized PublicParameters blob file.
+static PUBLIC_PARAMETERS_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Direct PublicParameters override (for test chains).
+static PUBLIC_PARAMETERS_OVERRIDE: OnceLock<Arc<ChunkyDKGPublicParameters>> = OnceLock::new();
+
+/// Production PublicParameters: checks override first, then reads from file path.
+/// Returns `None` if neither was configured or if reading/deserializing fails.
+pub static PUBLIC_PARAMETERS: Lazy<Option<Arc<ChunkyDKGPublicParameters>>> = Lazy::new(|| {
+    if let Some(pp) = PUBLIC_PARAMETERS_OVERRIDE.get() {
+        return Some(Arc::clone(pp));
+    }
+    let path = PUBLIC_PARAMETERS_PATH.get()?;
+    let start = Instant::now();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                "[PublicParameters] failed to read blob file {}: {}",
+                path.display(),
+                e
+            );
+            return None;
+        },
+    };
+    let pp: ChunkyDKGPublicParameters = match bcs::from_bytes(&bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(
+                "[PublicParameters] failed to deserialize blob ({} bytes): {}",
+                bytes.len(),
+                e
+            );
+            return None;
+        },
+    };
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "[PublicParameters] loaded from {} ({} bytes) in {:?}",
+        path.display(),
+        bytes.len(),
+        elapsed,
+    );
+    Some(Arc::new(pp))
+});
+
+/// Store the path to the PublicParameters blob file. No I/O is performed.
+pub fn set_public_parameters_path(path: PathBuf) {
+    PUBLIC_PARAMETERS_PATH
+        .set(path)
+        .expect("PublicParameters path already set");
+}
+
+/// Directly set the PublicParameters (for test chains).
+pub fn set_public_parameters(pp: Arc<ChunkyDKGPublicParameters>) {
+    PUBLIC_PARAMETERS_OVERRIDE
+        .set(pp)
+        .expect("PublicParameters already set");
+}
+
+/// Result of early PublicParameters initialization (metadata only, no file read).
+#[derive(Debug)]
+pub enum PublicParametersSource {
+    /// A blob file exists and will be lazily read on first access.
+    WillLoadFromFile { file_size: u64 },
+    /// Fell back to the built-in test parameters.
+    TestKeyFallback,
+    /// No PublicParameters available (no path configured, not a test chain).
+    NotAvailable,
+}
+
+/// Initialize the PublicParameters source. Checks metadata only (no file read).
+/// On test chains without an explicit path, sets the test parameters override.
+pub fn initialize_public_parameters(chain_id: ChainId) -> PublicParametersSource {
+    if let Some(path) = PUBLIC_PARAMETERS_PATH.get() {
+        match std::fs::metadata(path) {
+            Ok(meta) => PublicParametersSource::WillLoadFromFile {
+                file_size: meta.len(),
+            },
+            Err(_) => PublicParametersSource::NotAvailable,
+        }
+    } else if chain_id == ChainId::test() {
+        let _ = PUBLIC_PARAMETERS_OVERRIDE.set(Arc::clone(&TEST_PUBLIC_PARAMETERS));
+        PublicParametersSource::TestKeyFallback
+    } else {
+        PublicParametersSource::NotAvailable
+    }
+}
 
 /// Path to the BCS-serialized DigestKey blob file.
 static DIGEST_KEY_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -204,7 +303,7 @@ impl ChunkyDKGTranscript {
 #[derive(Clone, Debug)]
 pub struct ChunkyDKGSession {
     pub threshold_config: ChunkyDKGThresholdConfig,
-    pub public_parameters: ChunkyDKGPublicParameters,
+    pub public_parameters: Arc<ChunkyDKGPublicParameters>,
     pub session_metadata: ChunkyDKGSessionMetadata,
     pub eks: Vec<ChunkyEncryptPubKey>,
 }
@@ -280,20 +379,10 @@ impl ChunkyDKGSession {
         )
         .expect("Failed to create WeightedConfigArkworks");
 
-        // Create PublicParameters<Pairing> with max_num_shares based on total weight
-        // TODO(ibalajiarun): Modify PublicParameters to take in u64 weights.
-        let total_weight: u32 = profile.validator_weights.iter().sum::<u64>() as u32;
-
-        // TODO(ibalajiarun): Replace seed for public parameters with a trusted setup
-        let seed = dkg_session_metadata.dealer_epoch;
-        let mut rng_aptos = StdRng::seed_from_u64(seed);
-        let public_parameters = PublicParameters::new_with_commitment_base(
-            total_weight as usize,
-            aptos_dkg::pvss::chunky::DEFAULT_ELL_FOR_DEPLOYMENT,
-            threshold_config.get_total_num_players(),
-            G2Affine::generator(),
-            &mut rng_aptos,
-        );
+        let public_parameters = PUBLIC_PARAMETERS
+            .as_ref()
+            .expect("PublicParameters not initialized; call initialize_public_parameters first")
+            .clone();
 
         Arc::new(ChunkyDKGSession {
             threshold_config,
