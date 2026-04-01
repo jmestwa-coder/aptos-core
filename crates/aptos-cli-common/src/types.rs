@@ -333,6 +333,10 @@ pub struct TransactionSummary {
     /// The address of the deployed code object. Only present for code object deployment transactions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployed_object_address: Option<AccountAddress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<serde_json::Value>,
 }
 
 impl From<Transaction> for TransactionSummary {
@@ -360,6 +364,8 @@ impl From<&Transaction> for TransactionSummary {
                 vm_status: None,
                 timestamp_us: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::UserTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -377,6 +383,8 @@ impl From<&Transaction> for TransactionSummary {
                 timestamp_us: Some(txn.timestamp.0),
                 pending: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::GenesisTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -391,6 +399,8 @@ impl From<&Transaction> for TransactionSummary {
                 replay_protector: None,
                 timestamp_us: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::BlockMetadataTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -405,6 +415,8 @@ impl From<&Transaction> for TransactionSummary {
                 sequence_number: None,
                 replay_protector: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::StateCheckpointTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -419,6 +431,8 @@ impl From<&Transaction> for TransactionSummary {
                 sequence_number: None,
                 replay_protector: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::BlockEpilogueTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -433,6 +447,8 @@ impl From<&Transaction> for TransactionSummary {
                 sequence_number: None,
                 replay_protector: None,
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
             Transaction::ValidatorTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.transaction_info().hash,
@@ -447,6 +463,8 @@ impl From<&Transaction> for TransactionSummary {
                 version: Some(txn.transaction_info().version.0),
                 vm_status: Some(txn.transaction_info().vm_status.clone()),
                 deployed_object_address: None,
+                events: None,
+                changes: None,
             },
         }
     }

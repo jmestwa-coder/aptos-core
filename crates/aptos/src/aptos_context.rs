@@ -229,6 +229,8 @@ where
         version: Some(version),
         vm_status: Some(vm_status.to_string()),
         deployed_object_address: None,
+        events: None,
+        changes: None,
     })
 }
 
@@ -295,6 +297,8 @@ async fn simulate_using_session(
         version: None,
         vm_status: Some(vm_status.to_string()),
         deployed_object_address: None,
+        events: None,
+        changes: None,
     })
 }
 
