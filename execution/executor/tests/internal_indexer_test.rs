@@ -420,6 +420,10 @@ fn test_db_indexer_data() {
         ),
         (
             false,
+            "0x1::chunky_dkg_config_seqnum::ChunkyDKGConfigSeqNum",
+        ),
+        (
+            false,
             "0x1::account_abstraction::DerivableDispatchableAuthenticator",
         ),
         (false, "0x1::coin::CoinInfo<0x1::aptos_coin::AptosCoin>"),

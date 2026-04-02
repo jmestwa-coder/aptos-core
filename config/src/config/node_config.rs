@@ -75,6 +75,10 @@ pub struct NodeConfig {
     /// Once enough nodes restarted with the new value, the chain should unblock with randomness disabled.
     #[serde(default)]
     pub randomness_override_seq_num: u64,
+    /// In a ChunkyDKG stall, set this to be on-chain `ChunkyDKGConfigSeqNum` + 1.
+    /// Once enough nodes restarted with the new value, the chain should unblock with ChunkyDKG disabled.
+    #[serde(default)]
+    pub chunky_dkg_override_seq_num: u64,
     #[serde(default)]
     pub state_sync: StateSyncConfig,
     #[serde(default)]
