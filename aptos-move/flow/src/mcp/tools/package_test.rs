@@ -90,12 +90,13 @@ struct CoverageResponse {
 
 #[tool_router(router = package_test_router, vis = "pub(crate)")]
 impl FlowSession {
-    /// Run tests, then either establish a baseline or report newly covered lines.
+    // Run tests, then either establish a baseline or report newly covered lines.
+    // Set establish_baseline=true to save current coverage as baseline (use before
+    // generating new tests). Without establish_baseline, returns lines newly covered
+    // since baseline. Returns newly_covered=null if no baseline exists — call with
+    // establish_baseline first.
     #[tool(
-        description = "Run Move unit tests for a package. Set establish_baseline=true to save \
-                          current coverage as baseline (use before generating new tests). Without \
-                          establish_baseline, returns lines newly covered since baseline. Returns \
-                          newly_covered=null if no baseline exists — call with establish_baseline first.",
+        description = "Run Move unit tests for a package",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn move_package_test(
@@ -108,10 +109,10 @@ impl FlowSession {
             .unwrap_or_else(tool_error))
     }
 
+    // Uses existing coverage map if available, otherwise runs tests first.
+    // Use this to identify which code paths need test coverage.
     #[tool(
-        description = "Get uncovered source lines for a package, optionally scoped to a function. \
-                          Uses existing coverage map if available, otherwise runs tests first. \
-                          Use this to identify which code paths need test coverage.",
+        description = "Get uncovered source lines for a package",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn move_package_coverage(

@@ -33,11 +33,11 @@ const MAX_VC_TIMEOUT: usize = 60;
 
 #[tool_router(router = package_verify_router, vis = "pub(crate)")]
 impl FlowSession {
+    // Low-level prover tool. Requires phased verification workflow context
+    // (timeout handling, diagnostic interpretation) that is only available
+    // through subagent delegation.
     #[tool(
-        description = "Low-level prover tool — not for direct use. \
-                       Requires phased verification workflow context (timeout handling, \
-                       diagnostic interpretation) that is only available through \
-                       subagent delegation.",
+        description = "Verify Move specifications using the Move Prover",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn move_package_verify(

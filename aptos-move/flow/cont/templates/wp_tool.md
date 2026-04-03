@@ -11,6 +11,10 @@ Parameters:
 - **`package_path`** (required) — path to the Move package directory.
 - **`filter`** (optional) — `module_name` or `module_name::function_name`.
   When omitted, all target modules are inferred.
+- **`spec_output`** (optional, default `"inline"`) — where to write inferred specs.
+  `"inline"` injects specs into the original source files.
+  `"file"` writes separate `.spec.move` files alongside the sources, leaving
+  originals untouched. Use `"file"` when the user asks for specs in a separate file.
 
 If the program contains loops, they are broken into exit and iteration points.
 Loop variables are havoced and the loop invariant is expected to fix them.

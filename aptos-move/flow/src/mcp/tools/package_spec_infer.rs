@@ -15,6 +15,18 @@ use rmcp::{
 };
 use std::{fs, path::PathBuf, time::Instant};
 
+/// Controls where inferred specs are written.
+#[derive(Debug, Default, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SpecOutput {
+    /// Inject inferred specs inline into the original source files (default).
+    #[default]
+    Inline,
+    /// Write inferred specs to separate `.spec.move` files alongside the sources,
+    /// leaving the original source files untouched.
+    File,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct MovePackageSpecInferParams {
     /// Path to the Move package directory.
@@ -22,15 +34,20 @@ struct MovePackageSpecInferParams {
     /// Optional filter: `module_name` or `module_name::function_name`.
     /// When omitted, all target modules are inferred.
     filter: Option<String>,
+    /// Where to write inferred specifications. Defaults to `inline` (inject into
+    /// source files). Set to `file` to write separate `.spec.move` files instead,
+    /// keeping original sources untouched.
+    #[serde(default)]
+    spec_output: SpecOutput,
 }
 
 #[tool_router(router = package_spec_infer_router, vis = "pub(crate)")]
 impl FlowSession {
+    // Low-level WP inference tool. Requires multi-phase workflow context
+    // (loop-invariant synthesis, simplification, verification) that is only
+    // available through subagent delegation. See skill docs for spec_output param.
     #[tool(
-        description = "Low-level WP inference tool — not for direct use. \
-                       Requires multi-phase workflow context (loop-invariant synthesis, \
-                       simplification, verification) that is only available through \
-                       subagent delegation.",
+        description = "Infer specifications via weakest-precondition analysis",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn move_package_spec_infer(
@@ -45,6 +62,7 @@ impl FlowSession {
         self.mark_needs_bytecode(&params.package_path);
         let (pkg, _) = self.resolve_package(&params.package_path).await?;
         let filter = params.filter.clone();
+        let spec_output = params.spec_output;
 
         let result = tokio::task::spawn_blocking(move || {
             let mut data = pkg.lock().unwrap();
@@ -85,7 +103,10 @@ impl FlowSession {
             let mut options = move_prover::cli::Options::default();
             options.prover.verify_scope = verification_scope;
             options.inference.inference = true;
-            options.inference.inference_output = InferenceOutput::Unified;
+            options.inference.inference_output = match spec_output {
+                SpecOutput::Inline => InferenceOutput::Unified,
+                SpecOutput::File => InferenceOutput::File,
+            };
             options.inference.inference_output_dir = None;
             options.output_path = temp_dir
                 .path()
@@ -104,7 +125,7 @@ impl FlowSession {
 
             match inference_result {
                 Ok(()) => {
-                    // 6. Read each .enriched.move file, overwrite the original, and delete it.
+                    // 6. Collect output files depending on the output mode.
                     let mut modified_files: Vec<String> = Vec::new();
 
                     for module in data.env().get_modules() {
@@ -115,43 +136,64 @@ impl FlowSession {
                         let stem = source_path
                             .file_stem()
                             .expect("source file should have a stem");
-                        let enriched_path = source_path
+                        let source_dir = source_path
                             .parent()
-                            .expect("source file should have a parent directory")
-                            .join(format!("{}.enriched.move", stem.to_string_lossy()));
+                            .expect("source file should have a parent directory");
 
-                        if enriched_path.exists() {
-                            let content = fs::read_to_string(&enriched_path).map_err(|e| {
-                                rmcp::ErrorData::internal_error(
-                                    format!(
-                                        "failed to read enriched file {}: {}",
-                                        enriched_path.display(),
-                                        e
-                                    ),
-                                    None,
-                                )
-                            })?;
-                            fs::write(&source_path, &content).map_err(|e| {
-                                rmcp::ErrorData::internal_error(
-                                    format!(
-                                        "failed to write source file {}: {}",
-                                        source_path.display(),
-                                        e
-                                    ),
-                                    None,
-                                )
-                            })?;
-                            fs::remove_file(&enriched_path).map_err(|e| {
-                                rmcp::ErrorData::internal_error(
-                                    format!(
-                                        "failed to remove enriched file {}: {}",
-                                        enriched_path.display(),
-                                        e
-                                    ),
-                                    None,
-                                )
-                            })?;
-                            modified_files.push(source_path.to_string_lossy().into_owned());
+                        match spec_output {
+                            SpecOutput::Inline => {
+                                // Read each .enriched.move file, overwrite the
+                                // original, and delete the enriched file.
+                                let enriched_path = source_dir
+                                    .join(format!("{}.enriched.move", stem.to_string_lossy()));
+
+                                if enriched_path.exists() {
+                                    let content =
+                                        fs::read_to_string(&enriched_path).map_err(|e| {
+                                            rmcp::ErrorData::internal_error(
+                                                format!(
+                                                    "failed to read enriched file {}: {}",
+                                                    enriched_path.display(),
+                                                    e
+                                                ),
+                                                None,
+                                            )
+                                        })?;
+                                    fs::write(&source_path, &content).map_err(|e| {
+                                        rmcp::ErrorData::internal_error(
+                                            format!(
+                                                "failed to write source file {}: {}",
+                                                source_path.display(),
+                                                e
+                                            ),
+                                            None,
+                                        )
+                                    })?;
+                                    fs::remove_file(&enriched_path).map_err(|e| {
+                                        rmcp::ErrorData::internal_error(
+                                            format!(
+                                                "failed to remove enriched file {}: {}",
+                                                enriched_path.display(),
+                                                e
+                                            ),
+                                            None,
+                                        )
+                                    })?;
+                                    modified_files
+                                        .push(source_path.to_string_lossy().into_owned());
+                                }
+                            },
+                            SpecOutput::File => {
+                                // The prover wrote a .spec.move file; collect
+                                // its path without touching the original source.
+                                let spec_path = source_dir
+                                    .join(format!("{}.spec.move", stem.to_string_lossy()));
+
+                                if spec_path.exists() {
+                                    modified_files
+                                        .push(spec_path.to_string_lossy().into_owned());
+                                }
+                            },
                         }
                     }
 
@@ -162,7 +204,7 @@ impl FlowSession {
                         )]))
                     } else {
                         log::info!(
-                            "move_package_spec_infer: injected specs into {} file(s)",
+                            "move_package_spec_infer: wrote specs to {} file(s)",
                             modified_files.len()
                         );
 
@@ -180,9 +222,14 @@ impl FlowSession {
                             }
                         }
 
+                        let action = match spec_output {
+                            SpecOutput::Inline => "injected specs into",
+                            SpecOutput::File => "wrote spec files for",
+                        };
                         let mut msg = format!(
-                            "inference succeeded, injected specs into {} file(s) \
+                            "inference succeeded, {} {} file(s) \
                              (read the files to see the changes):\n",
+                            action,
                             modified_files.len()
                         );
                         for path in &modified_files {
