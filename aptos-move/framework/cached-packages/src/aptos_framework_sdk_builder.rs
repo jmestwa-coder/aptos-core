@@ -557,6 +557,14 @@ pub enum EntryFunctionCall {
         amount: u64,
     },
 
+    EthereumDerivableAccountAuthorizeDomain {
+        domain: Vec<u8>,
+    },
+
+    EthereumDerivableAccountRevokeDomain {
+        domain: Vec<u8>,
+    },
+
     /// This can be called to install or update a set of JWKs for a federated OIDC provider.  This function should
     /// be invoked to intially install a set of JWKs or to update a set of JWKs when a keypair is rotated.
     ///
@@ -1562,6 +1570,12 @@ impl EntryFunctionCall {
                 pool_address,
                 amount,
             } => delegation_pool_withdraw(pool_address, amount),
+            EthereumDerivableAccountAuthorizeDomain { domain } => {
+                ethereum_derivable_account_authorize_domain(domain)
+            },
+            EthereumDerivableAccountRevokeDomain { domain } => {
+                ethereum_derivable_account_revoke_domain(domain)
+            },
             JwksUpdateFederatedJwkSet {
                 iss,
                 kid_vec,
@@ -3439,6 +3453,36 @@ pub fn delegation_pool_withdraw(pool_address: AccountAddress, amount: u64) -> Tr
             bcs::to_bytes(&pool_address).unwrap(),
             bcs::to_bytes(&amount).unwrap(),
         ],
+    ))
+}
+
+pub fn ethereum_derivable_account_authorize_domain(domain: Vec<u8>) -> TransactionPayload {
+    TransactionPayload::EntryFunction(EntryFunction::new(
+        ModuleId::new(
+            AccountAddress::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 1,
+            ]),
+            ident_str!("ethereum_derivable_account").to_owned(),
+        ),
+        ident_str!("authorize_domain").to_owned(),
+        vec![],
+        vec![bcs::to_bytes(&domain).unwrap()],
+    ))
+}
+
+pub fn ethereum_derivable_account_revoke_domain(domain: Vec<u8>) -> TransactionPayload {
+    TransactionPayload::EntryFunction(EntryFunction::new(
+        ModuleId::new(
+            AccountAddress::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 1,
+            ]),
+            ident_str!("ethereum_derivable_account").to_owned(),
+        ),
+        ident_str!("revoke_domain").to_owned(),
+        vec![],
+        vec![bcs::to_bytes(&domain).unwrap()],
     ))
 }
 
@@ -6334,6 +6378,30 @@ mod decoder {
         }
     }
 
+    pub fn ethereum_derivable_account_authorize_domain(
+        payload: &TransactionPayload,
+    ) -> Option<EntryFunctionCall> {
+        if let TransactionPayload::EntryFunction(script) = payload {
+            Some(EntryFunctionCall::EthereumDerivableAccountAuthorizeDomain {
+                domain: bcs::from_bytes(script.args().get(0)?).ok()?,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn ethereum_derivable_account_revoke_domain(
+        payload: &TransactionPayload,
+    ) -> Option<EntryFunctionCall> {
+        if let TransactionPayload::EntryFunction(script) = payload {
+            Some(EntryFunctionCall::EthereumDerivableAccountRevokeDomain {
+                domain: bcs::from_bytes(script.args().get(0)?).ok()?,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn jwks_update_federated_jwk_set(
         payload: &TransactionPayload,
     ) -> Option<EntryFunctionCall> {
@@ -7793,6 +7861,14 @@ static SCRIPT_FUNCTION_DECODER_MAP: once_cell::sync::Lazy<EntryFunctionDecoderMa
         map.insert(
             "delegation_pool_withdraw".to_string(),
             Box::new(decoder::delegation_pool_withdraw),
+        );
+        map.insert(
+            "ethereum_derivable_account_authorize_domain".to_string(),
+            Box::new(decoder::ethereum_derivable_account_authorize_domain),
+        );
+        map.insert(
+            "ethereum_derivable_account_revoke_domain".to_string(),
+            Box::new(decoder::ethereum_derivable_account_revoke_domain),
         );
         map.insert(
             "jwks_update_federated_jwk_set".to_string(),
