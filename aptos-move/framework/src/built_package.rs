@@ -257,9 +257,6 @@ fn make_model_build_config(
             .unwrap_or_default()
             .infer_bytecode_version(bytecode_version),
     );
-    let cv = compiler_version.unwrap_or_default();
-    let lv = language_version.unwrap_or_default();
-    cv.check_language_support(lv)?;
     Ok(BuildConfig {
         dev_mode,
         additional_named_addresses,
@@ -514,7 +511,6 @@ impl BuiltPackage {
             )?;
             writer.reset()?;
         }
-        effective_compiler_version.check_language_support(effective_language_version)?;
         Ok(())
     }
 
